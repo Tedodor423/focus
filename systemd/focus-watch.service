@@ -1,0 +1,22 @@
+# /etc/systemd/user/focus-watch.service — installed by install.sh (root),
+# enabled globally there and per user by install-user.sh.
+[Unit]
+Description=focus screen monitor (window titles + local vision model)
+Documentation=file:///home/theo/nextcloud/code/focus/README.md
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/focus-watch
+# SIGTERM: focus-watch un-freezes and un-hides every window it touched, then exits 0.
+# ExecStopPost runs after every stop, crash or failed start too, and restores
+# anything still recorded in ~/.local/state/focus/watch.json.
+ExecStopPost=/usr/local/bin/focus-watch --restore
+Restart=always
+RestartSec=10
+# Applies to the main process's stop and, separately, to ExecStopPost.
+TimeoutStopSec=30
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+# Local config with personal values; the tracked templates are etc/*.example.*
+etc/config.toml
+etc/judge.md

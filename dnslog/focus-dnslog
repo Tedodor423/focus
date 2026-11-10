@@ -1,0 +1,385 @@
+#!/usr/bin/python3 -I
+"""focus-dnslog: DNS activity log for focus (runs as root, blocks nothing).
+
+Follows `resolvectl monitor --json=short` and appends one JSON line per
+answered query to /var/log/focus/dns/YYYY-MM-DD.jsonl (local date):
+
+    {"t": 1793899990.123, "name": "news.ycombinator.com", "type": "A",
+     "addrs": ["209.216.230.207"], "cnames": [], "blocked": false}
+
+`t` and `name` are the contract (ARCHITECTURE.md §1); focusd uses them to check
+that a penalty domain was really visited (§6b). `name` is lowercase without the
+trailing dot. The other fields are informational and omitted when empty.
+
+What resolvectl prints (systemd >= 256, varlink io.systemd.Resolve.Monitor,
+SubscribeQueryResults): one JSON object per completed query, e.g.
+
+    {"state":"success","question":[{"class":1,"type":1,"name":"example.com"}],
+     "answer":[{"rr":{"key":{"class":1,"type":1,"name":"example.com"},
+                      "address":[93,184,215,14]},"raw":"...","ifindex":3}]}
+
+`state` is "success", "rcode-failure", "timeout", "not-found", ... and only
+"success" counts as answered. A dual-stack lookup carries two question keys
+(A and AAAA); each becomes its own line. Queries answered from /etc/hosts are
+included, so a lookup of a blocked site shows up with addrs 0.0.0.0/:: and
+"blocked": true. Cache hits are reported too. Anything unparseable is skipped.
+
+The monitor needs root (unprivileged it asks polkit; we pass
+--no-ask-password so it fails instead of hanging). If resolvectl exits (e.g.
+systemd-resolved restarted), it is restarted with a backoff.
+
+Files: /var/log/focus/dns/ root:<user> 0750, day files root:<user> 0640,
+where <user> is `user` from /etc/focus/config.toml (default theo). Day files
+older than --keep-days are deleted. FOCUS_ROOT prefixes every path (tests);
+with FOCUS_ROOT set or when not root, no chown happens.
+
+Usage:
+    focus-dnslog [--outdir DIR] [--command CMD] [--keep-days N] [--group NAME]
+                 [--once] [--stdin]
+"""
+
+import argparse
+import datetime
+import grp
+import ipaddress
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import time
+
+DEFAULT_COMMAND = "resolvectl --no-ask-password monitor --json=short"
+DEFAULT_KEEP_DAYS = 30
+DAY_FILE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.jsonl$")
+MAX_LINE = 1 << 20  # resolvectl lines are bounded by DNS message size; be defensive anyway
+
+# RR type numbers → names (RFC 1035, 3596, 6672, 9460, ...). Unknown → "TYPE<n>" (RFC 3597).
+RR_TYPES = {
+    1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 13: "HINFO", 15: "MX",
+    16: "TXT", 28: "AAAA", 29: "LOC", 33: "SRV", 35: "NAPTR", 39: "DNAME",
+    43: "DS", 46: "RRSIG", 47: "NSEC", 48: "DNSKEY", 50: "NSEC3", 52: "TLSA",
+    64: "SVCB", 65: "HTTPS", 99: "SPF", 255: "ANY", 257: "CAA",
+}
+T_A, T_CNAME, T_DNAME, T_AAAA = 1, 5, 39, 28
+
+
+def log(msg):
+    print(f"focus-dnslog: {msg}", file=sys.stderr, flush=True)
+
+
+def focus_root():
+    return os.environ.get("FOCUS_ROOT", "")
+
+
+def type_name(t):
+    if isinstance(t, int) and not isinstance(t, bool):
+        return RR_TYPES.get(t, f"TYPE{t}")
+    if isinstance(t, str) and t:
+        return t.upper()
+    return None
+
+
+def clean_name(name):
+    if not isinstance(name, str):
+        return None
+    name = name.strip().rstrip(".").lower()
+    if not name or len(name) > 253 or any(c.isspace() for c in name):
+        return None
+    return name
+
+
+def rr_address(rr, rtype):
+    addr = rr.get("address")
+    if not isinstance(addr, list) or not all(isinstance(b, int) and 0 <= b <= 255 for b in addr):
+        return None
+    try:
+        if rtype == T_A and len(addr) == 4:
+            return str(ipaddress.IPv4Address(bytes(addr)))
+        if rtype == T_AAAA and len(addr) == 16:
+            return str(ipaddress.IPv6Address(bytes(addr)))
+    except ValueError:
+        return None
+    return None
+
+
+def parse_line(line, now=None, all_states=False):
+    """One resolvectl JSON line → list of log records (possibly empty)."""
+    if isinstance(line, bytes):
+        line = line.decode("utf-8", "replace")
+    line = line.strip().strip("\x1e").strip()  # tolerate json-seq framing
+    if not line or line[0] != "{" or len(line) > MAX_LINE:
+        return []
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        return []
+    if not isinstance(obj, dict) or "ready" in obj:
+        return []
+    state = obj.get("state")
+    if state != "success" and not all_states:
+        return []
+    questions = obj.get("question")
+    if not isinstance(questions, list):
+        return []
+    answers = obj.get("answer")
+    if not isinstance(answers, list):
+        answers = []
+
+    rrs = []
+    for a in answers:
+        if isinstance(a, dict) and isinstance(a.get("rr"), dict):
+            rr = a["rr"]
+            key = rr.get("key")
+            if isinstance(key, dict) and isinstance(key.get("type"), int):
+                rrs.append((key["type"], rr))
+    cnames = []
+    for rtype, rr in rrs:
+        if rtype in (T_CNAME, T_DNAME):
+            target = clean_name(rr.get("name"))
+            if target and target not in cnames:
+                cnames.append(target)
+
+    t = round(time.time() if now is None else now, 3)
+    out, seen = [], set()
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        name = clean_name(q.get("name"))
+        qtype = q.get("type")
+        tname = type_name(qtype)
+        if not name or not tname or (name, tname) in seen:
+            continue
+        seen.add((name, tname))
+        rec = {"t": t, "name": name, "type": tname}
+        if state != "success":
+            rec["state"] = state
+        if qtype in (T_A, T_AAAA):
+            addrs = []
+            for rtype, rr in rrs:
+                if rtype == qtype:
+                    a = rr_address(rr, rtype)
+                    if a and a not in addrs:
+                        addrs.append(a)
+            if addrs:
+                rec["addrs"] = addrs
+                rec["blocked"] = all(a in ("0.0.0.0", "::") for a in addrs)
+        if cnames:
+            rec["cnames"] = cnames
+        out.append(rec)
+    return out
+
+
+class DayWriter:
+    """Appends records to <outdir>/YYYY-MM-DD.jsonl, switching files at local midnight."""
+
+    def __init__(self, outdir, keep_days=DEFAULT_KEEP_DAYS, gid=None):
+        self.outdir = outdir
+        self.keep_days = keep_days
+        self.gid = gid  # chown target group, None = don't chown
+        self.day = None
+        self.fh = None
+
+    def ensure_dir(self):
+        parent = os.path.dirname(self.outdir.rstrip("/"))
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent, mode=0o755, exist_ok=True)
+            os.chmod(parent, 0o755)  # theo traverses it to read the day files
+        os.makedirs(self.outdir, mode=0o750, exist_ok=True)
+        os.chmod(self.outdir, 0o750)
+        if self.gid is not None:
+            os.chown(self.outdir, 0, self.gid)
+
+    def _open(self, day):
+        self.close()
+        self.ensure_dir()
+        path = os.path.join(self.outdir, day + ".jsonl")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC, 0o640)
+        os.fchmod(fd, 0o640)
+        if self.gid is not None:
+            os.fchown(fd, 0, self.gid)
+        self.fh = os.fdopen(fd, "a", encoding="utf-8")
+        self.day = day
+        self.prune()
+
+    def write(self, rec):
+        day = datetime.datetime.fromtimestamp(rec["t"]).strftime("%Y-%m-%d")
+        if day != self.day or self.fh is None:
+            self._open(day)
+        self.fh.write(json.dumps(rec, separators=(",", ":"), ensure_ascii=False) + "\n")
+        self.fh.flush()  # focusd looks at the last 15 minutes; don't sit in a buffer
+
+    def prune(self, today=None):
+        if not self.keep_days or self.keep_days <= 0:
+            return []
+        today = today or datetime.date.today()
+        cutoff = today - datetime.timedelta(days=self.keep_days)
+        removed = []
+        try:
+            names = os.listdir(self.outdir)
+        except OSError:
+            return removed
+        for fn in names:
+            m = DAY_FILE.match(fn)
+            if not m:
+                continue
+            try:
+                d = datetime.date.fromisoformat(m.group(1))
+            except ValueError:
+                continue
+            if d < cutoff:
+                try:
+                    os.unlink(os.path.join(self.outdir, fn))
+                    removed.append(fn)
+                except OSError as e:
+                    log(f"cannot remove {fn}: {e}")
+        return removed
+
+    def close(self):
+        if self.fh is not None:
+            try:
+                self.fh.close()
+            except OSError:
+                pass
+        self.fh = None
+        self.day = None
+
+
+def config_user(root):
+    path = root + "/etc/focus/config.toml"
+    try:
+        import tomllib
+        with open(path, "rb") as f:
+            user = tomllib.load(f).get("user")
+        if isinstance(user, str) and re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", user):
+            return user
+    except (OSError, ValueError, ImportError):
+        pass
+    return "theo"
+
+
+def resolve_gid(group, root):
+    if root or os.geteuid() != 0:
+        return None
+    try:
+        return grp.getgrnam(group).gr_gid
+    except KeyError:
+        log(f"group {group!r} not found; log files stay root:root")
+        return None
+
+
+class Runner:
+    def __init__(self, writer, command, once=False, all_states=False):
+        self.writer = writer
+        self.command = command
+        self.once = once
+        self.all_states = all_states
+        self.child = None
+        self.stopping = False
+        self.count = 0
+
+    def stop(self, *_):
+        self.stopping = True
+        child = self.child
+        if child is not None and child.poll() is None:
+            try:
+                child.terminate()
+            except OSError:
+                pass
+
+    def consume(self, stream):
+        for line in stream:
+            for rec in parse_line(line, all_states=self.all_states):
+                try:
+                    self.writer.write(rec)
+                    self.count += 1
+                except OSError as e:
+                    log(f"write failed: {e}")
+            if self.stopping:
+                break
+
+    def run(self):
+        backoff = 1.0
+        while not self.stopping:
+            started = time.monotonic()
+            try:
+                self.child = subprocess.Popen(
+                    self.command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    text=True, encoding="utf-8", errors="replace", bufsize=1,
+                )
+            except OSError as e:
+                log(f"cannot start {self.command[0]}: {e}")
+                rc = None
+            else:
+                try:
+                    self.consume(self.child.stdout)
+                finally:
+                    if self.child.poll() is None:
+                        self.child.terminate()
+                    try:
+                        rc = self.child.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        self.child.kill()
+                        rc = self.child.wait()
+                    self.child = None
+            if self.stopping or self.once:
+                break
+            if time.monotonic() - started > 60:
+                backoff = 1.0
+            log(f"{self.command[0]} exited ({rc}); restarting in {backoff:.0f}s")
+            deadline = time.monotonic() + backoff
+            while not self.stopping and time.monotonic() < deadline:
+                time.sleep(0.2)
+            backoff = min(backoff * 2, 30.0)
+        self.writer.close()
+        return 0
+
+
+def main(argv=None):
+    root = focus_root()
+    ap = argparse.ArgumentParser(prog="focus-dnslog", description=__doc__.split("\n")[0])
+    ap.add_argument("--outdir", default=root + "/var/log/focus/dns")
+    ap.add_argument("--command", default=os.environ.get("FOCUS_DNSLOG_COMMAND", DEFAULT_COMMAND),
+                    help="monitor command (split like a shell, no shell involved)")
+    ap.add_argument("--keep-days", type=int, default=DEFAULT_KEEP_DAYS,
+                    help="delete day files older than this (0 = keep all)")
+    ap.add_argument("--group", default=None, help="group for the log files (default: config user)")
+    ap.add_argument("--once", action="store_true", help="exit when the command exits (no restart)")
+    ap.add_argument("--stdin", action="store_true", help="read monitor JSON lines from stdin")
+    ap.add_argument("--all-states", action="store_true",
+                    help="also log failed lookups (adds a 'state' field)")
+    args = ap.parse_args(argv)
+
+    if root and not os.path.isabs(root):
+        log("FOCUS_ROOT must be absolute")
+        return 2
+    gid = resolve_gid(args.group or config_user(root), root)
+    writer = DayWriter(args.outdir, keep_days=args.keep_days, gid=gid)
+    try:
+        writer.ensure_dir()
+        writer.prune()
+    except OSError as e:
+        log(f"cannot prepare {args.outdir}: {e}")
+        return 1
+
+    runner = Runner(writer, shlex.split(args.command), once=args.once, all_states=args.all_states)
+    signal.signal(signal.SIGTERM, runner.stop)
+    signal.signal(signal.SIGINT, runner.stop)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+    if args.stdin:
+        try:
+            runner.consume(sys.stdin)
+        finally:
+            writer.close()
+        return 0
+    log(f"logging to {args.outdir} via: {args.command}")
+    rc = runner.run()
+    log(f"stopped after {runner.count} records")
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

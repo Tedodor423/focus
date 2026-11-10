@@ -1,0 +1,26 @@
+# /etc/systemd/system/focusd.service — installed by install.sh
+[Unit]
+Description=focus daemon: site blocking with AI-judged unlocks
+Documentation=file:///home/theo/nextcloud/code/focus/README.md
+After=network.target systemd-resolved.service
+Wants=focus-dnslog.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/focusd
+# SIGHUP = reload config. SIGTERM = lock every group, reconcile, exit 0 (fails closed).
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+UMask=0022
+# /run/focusd (socket dir, theo must reach focusd.sock) and /var/lib/focus.
+RuntimeDirectory=focusd
+RuntimeDirectoryMode=0755
+StateDirectory=focus
+StateDirectoryMode=0755
+# No sandboxing on purpose: focusd writes /etc/hosts and /etc/{chromium,vivaldi}
+# policies, and the judge (claude -p, started as theo) needs theo's home.
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,360 @@
+# etc/config.example.toml — example config for focus v1 (light mode)
+#
+# Copy it to etc/config.toml (git-ignored, keeps your real values out of the
+# repo) and edit that: at least `user`, [judge] command, [safety] never_block,
+# the groups and [watch]. install.sh installs etc/config.toml as
+# /etc/focus/config.toml (root:root 0644); without a local copy it falls back to
+# this example, with a warning. focusd re-reads it when it changes; focus-watch
+# reads [watch] and [groups.*] itself.
+#
+# Decisions marked "Approved by Theo 2026-11-10" were confirmed in the build session.
+#
+# How blocking works (ARCHITECTURE.md §1):
+#   hosts      exact host names → /etc/hosts (0.0.0.0 and ::). Works for every
+#              program, but no wildcards and no paths.
+#   url_block  Chromium/Vivaldi policy URLBlocklist. "example.com" also blocks
+#              every subdomain; "example.com/path" blocks that path prefix.
+#   url_allow  URLAllowlist exceptions. The more specific rule wins, so
+#              "music.youtube.com" beats "youtube.com".
+#   YouTube and Instagram are browser-policy only (no hosts), so YouTube Music and
+#   Instagram DMs keep working everywhere.
+#
+# Regexes (webapp_classes, title_patterns, [watch] patterns) are Python `re`,
+# searched (not anchored unless they start with ^). '(?i)' = ignore case.
+# Window titles here look like "<page title> - YouTube - Vivaldi"; Chromium
+# web apps (~/.local/bin/chromium-webapp) have no browser suffix and a class
+# like "chrome-youtube.com__-Default" (host + path of the app URL).
+#
+# Group title_patterns and distraction_title_patterns are only applied to
+# browser and web-app windows (§12 amendments). They are long because a site
+# name may only match in the shapes sites use for their own pages:
+#   whole title       "Twitch", "(2) Twitch - Vivaldi"   (an optional "(N) "
+#                     notification count, an optional browser-name suffix)
+#   last segment      "<story> | Hacker News - Vivaldi", "<video> - YouTube"
+#   first segment     "TikTok - Make Your Day", "Prime Video: <show>", unless a
+#                     later segment is Wikipedia / Google Search / GitHub / ...
+# so "user/agar.io-clone · GitHub" or "Facebook - Wikipedia" don't count.
+# The lookarounds keep the match itself to the site name, which focus-watch
+# reports as the "app". tests/test_install_config.py has ~60 example titles.
+
+user = "theo"              # your login name: the only non-root uid allowed on the socket; the judge runs as this user
+mode = "light"
+day_starts_at = "04:00"    # "today" (budgets, flags) starts at 04:00 local time
+reconcile_seconds = 30
+
+[limits]
+max_unlock_minutes = 20    # cap per grant
+daily_minutes = 40         # default per-group budget per day
+deny_cooldown_minutes = 5  # after a deny, that group can't be asked for again for 5 min
+judge_calls_per_hour = 8   # all groups and appeals together
+max_followups = 3          # the judge may ask up to 3 follow-up questions
+
+[judge]
+command = ["/home/theo/.local/share/mise/command-wrappers/bin/claude"]   # full path of your claude CLI (`command -v claude`)
+model = "sonnet"
+timeout_seconds = 90
+policy_file = "/etc/focus/judge.md"
+context_files = []
+
+[browser]
+policy_dirs = ["/etc/chromium/policies/managed", "/etc/vivaldi/policies/managed"]
+disable_doh = true               # DNS-over-HTTPS would bypass /etc/hosts
+force_google_safesearch = true   # SafeSearch on Google results (helps the porn group). Approved by Theo 2026-11-10
+
+[safety]
+# Things that must never break, whatever a group, a downloaded list or a
+# screen-monitor penalty says. A name equal to or under one of these is dropped
+# from /etc/hosts and from penalties (with a warning). It does not punch holes
+# in url_block (nothing below is in any group anyway).
+never_block = [
+  # The judge itself (claude -p on Theo's subscription: API, OAuth, updates) and Claude.
+  "anthropic.com", "claude.ai", "claude.com",
+  # Google sign-in (accounts.google.com) and the Google services sign-in and
+  # YouTube Music depend on: Gmail, Calendar, Drive, Scholar, Meet, fonts, APIs.
+  "google.com", "google.cz", "googleapis.com", "gstatic.com", "googleusercontent.com",
+  # Microsoft login (university/work SSO, Minecraft/Xbox login) and Microsoft 365:
+  # Outlook, Teams, OneDrive, OneNote (Theo's OneNote web apps).
+  "microsoftonline.com", "microsoft.com", "live.com", "office.com", "office.net",
+  "outlook.com", "sharepoint.com", "onenote.com", "msauth.net", "msftauth.net",
+  # Your university or employer: SSO, VPN, library, email. Uncomment and fill in.
+  # "your-university.ac.uk",
+  # Your own Nextcloud/file-sync server (notes, synced files, this repo): put its
+  # domain here instead of the placeholder.
+  "nextcloud.example.com",
+  # Tailscale: control plane, DERP relays, MagicDNS names (*.ts.net) of your tailnet.
+  "tailscale.com", "tailscale.io", "ts.net",
+  # Code: GitHub (repos, raw files, release assets, Pages docs), Python packages.
+  "github.com", "githubusercontent.com", "githubassets.com", "github.io",
+  "pypi.org", "pythonhosted.org",
+  # System updates: Arch (mirrors, AUR, ping.archlinux.org connectivity check),
+  # Omarchy's package repo, time sync.
+  "archlinux.org", "pkgbuild.com", "omarchy.org", "pool.ntp.org",
+  # The local vision model's registry (focus-watch, ollama pull).
+  "ollama.com",
+  # Core science infrastructure, so a monitor mistake can never block it. Approved by Theo 2026-11-10.
+  "arxiv.org", "doi.org", "overleaf.com", "nih.gov", "biorxiv.org", "medrxiv.org", "europepmc.org",
+]
+
+# Porn block list: StevenBlack/hosts "porn-only" alternate (extension "porn",
+# WITHOUT the unified adware/malware base). Plain `0.0.0.0 name` hosts format.
+# Checked 2026-11-10: list dated 2026-11-08, 76,800 entries (1 invalid line),
+# covers the big sites (pornhub, xvideos, xnxx, xhamster, onlyfans, chaturbate,
+# rule34, e-hentai, ...). Collisions with never_block: one *.github.io name,
+# which gets dropped. min/max guard against a truncated or wrong download
+# (the cached copy is kept and a list_error event logged).
+[lists.porn]
+url = "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn-only/hosts"
+refresh_days = 7
+min_entries = 40000
+max_entries = 150000
+
+# ---------------------------------------------------------------- groups
+# Order matters only for rendering. Every group: enabled, unlockable, optional
+# max_minutes/daily_minutes (effective cap = min(max_minutes, limits.max_unlock_minutes)).
+
+[groups.youtube]
+label = "YouTube"
+enabled = true
+unlockable = true
+hosts = []                 # browser policy only: YouTube Music must keep working
+lists = []
+url_block = ["youtube.com", "youtu.be"]
+url_allow = [
+  "music.youtube.com",     # YouTube Music stays open
+  "youtube.com/embed",     # videos embedded in other pages (lectures, docs)
+  "accounts.youtube.com",  # Google sign-in passes through here; without it Music can't log in
+  "consent.youtube.com",   # cookie-consent redirect (GB/EU): a fresh or expired consent cookie sends music.youtube.com here first
+]
+# youtube-nocookie.com (privacy embeds) is deliberately not blocked.
+webapp_classes = ['^chrome-(www\.|m\.)?youtube\.com__']   # the YouTube web app; not YouTube Music's chrome-music.youtube.com__
+title_patterns = [
+  '(?i)(?:^|(?<=^\(\d\) )|(?<=^\(\d\d\) )|(?<=^\(\d\d\d\) )|(?<=[-—–|•·] ))(?:YouTube)(?=(?: [-—–] (?:Vivaldi|Chromium|Google Chrome|Brave|(?:Mozilla )?Firefox)\b[^-—–|]*)?$)',   # "<video> - YouTube[ - Vivaldi]", "(3) YouTube"; never "… - YouTube Music"
+]
+
+[groups.reddit]
+label = "Reddit"
+enabled = true
+unlockable = true
+hosts = [
+  "reddit.com", "www.reddit.com", "old.reddit.com", "new.reddit.com", "np.reddit.com",
+  "m.reddit.com", "i.reddit.com", "sh.reddit.com", "amp.reddit.com", "out.reddit.com",
+  "oauth.reddit.com", "gateway.reddit.com", "gql.reddit.com", "gql-fed.reddit.com",
+  "redd.it", "i.redd.it", "v.redd.it", "preview.redd.it", "external-preview.redd.it",
+  "redditmedia.com", "www.redditmedia.com", "redditstatic.com", "www.redditstatic.com",
+]
+lists = []
+url_block = ["reddit.com", "redd.it", "redditmedia.com"]
+url_allow = []
+webapp_classes = ['^chrome-([a-z]+\.)?reddit\.com__']
+title_patterns = [
+  ' : r/[A-Za-z0-9_]{2,21}(?=(?: [-—–] (?:Vivaldi|Chromium|Google Chrome|Brave|(?:Mozilla )?Firefox)\b[^-—–|]*)?$)',   # "<post> : r/sub"
+  '(?:^|(?<=^\(\d\) )|(?<=^\(\d\d\) )|(?<=^\(\d\d\d\) ))r/[A-Za-z0-9_]{2,21}(?=(?: [-—–] (?:Vivaldi|Chromium|Google Chrome|Brave|(?:Mozilla )?Firefox)\b[^-—–|]*)?$)',   # "r/sub"
+  '(?:^|(?<=^\(\d\) )|(?<=^\(\d\d\) )|(?<=^\(\d\d\d\) ))r/[A-Za-z0-9_]{2,21} on Reddit: ',   # "r/sub on Reddit: <post>"
+  '(?i)(?:^|(?<=^\(\d\) )|(?<=^\(\d\d\) )|(?<=^\(\d\d\d\) )|(?<=[-—–|•·] ))(?:Reddit)(?=(?: [-—–] (?:Vivaldi|Chromium|Google Chrome|Brave|(?:Mozilla )?Firefox)\b[^-—–|]*)?$)',   # "… - Reddit", "(4) Reddit"
+  '(?i)(?:^|(?<=^\(\d\) )|(?<=^\(\d\d\) )|(?<=^\(\d\d\d\) ))(?:Reddit)(?=(?: [-—–|•·]|:) )(?!.*[-—–|] (?:Wikipedia|Wiktionary|Google Search|Hledat Googlem|Vyhledat Googlem|DuckDuckGo|Bing|GitHub|Stack Overflow)\b)',   # "Reddit - Dive into anything"
+]
+
+[groups.x]
+label = "X"
+enabled = true
+unlockable = true
+hosts = [
+  "x.com", "www.x.com", "mobile.x.com", "api.x.com", "pro.x.com",
+  "twitter.com", "www.twitter.com", "mobile.twitter.com", "api.twitter.com", "tweetdeck.twitter.com",
+  "xcancel.com", "nitter.net",   # read-only X mirrors (the obvious workaround). Approved by Theo 2026-11-10.
+]
+lists = []
+url_block = ["x.com", "twitter.com", "xcancel.com", "nitter.net"]
+url_allow = []
+# t.co (link shortener) and twimg.com (media) stay reachable so X links/embeds
+# elsewhere don't break; with x.com blocked they lead nowhere anyway.
+webapp_classes = ['^chrome-(www\.|mobile\.)?(x|twitter)\.com__']   # the X web app: chrome-x.com__-Default
+title_patterns = [
+  '(?<= / )(?:X|Twitter)(?=(?: [-—–] (?:Vivaldi|Chromium|Google Chrome|Brave|(?:Mozilla )?Firefox)\b[^-—–|]*)?$)',   # "Home / X", "(2) Name on X: … / X - Vivaldi" (case-sensitive)
+]
+
+[groups.instagram]
+label = "Instagram (feed)"
+enabled = true
+unlockable = true
+hosts = []                 # browser policy only: DMs must keep working
+lists = []
+url_block = ["instagram.com"]   # feed, reels, explore, stories, profiles
+url_allow = [
+  "instagram.com/direct",            # DMs
+  "instagram.com/accounts/login",    # login, incl. two-factor
+  "instagram.com/accounts/password", # password reset
+  "instagram.com/challenge",         # "was this you?" security checks
+]
+# Limitation: the policy only acts on page loads. Instagram is a single-page
+# app, so clicking from DMs to the feed inside the same tab isn't stopped until
+# the next reload. The screen monitor is the backstop there.
+webapp_classes = []        # an Instagram web app is used for DMs, so never close it on re-lock
+title_patterns = [
+  '(?i)\(@[\w.]+\) • Instagram photos and videos',   # profile pages
+  '(?i) on Instagram: ',                             # posts and reels
+]
+# A bare "Instagram" title is used for the feed AND the DM inbox, so it is not a
+# pattern; the vision step decides those.
+
+[groups.games]
+label = "Online games"
+enabled = true
+unlockable = true
+max_minutes = 20
+daily_minutes = 30
+# Approved by Theo 2026-11-10 (block everything listed). Browser game portals, .io games, chess,
+# GeoGuessr, NYT games. Chess and Wordle are the ones you may want to keep.
+hosts = [
+  "poki.com", "www.poki.com", "crazygames.com", "www.crazygames.com",
+  "coolmathgames.com", "www.coolmathgames.com", "miniclip.com", "www.miniclip.com",
+  "kongregate.com", "www.kongregate.com", "armorgames.com", "www.armorgames.com",
+  "y8.com", "www.y8.com", "friv.com", "www.friv.com", "agame.com", "www.agame.com",
+  "addictinggames.com", "www.addictinggames.com", "iogames.space",
+  "slither.io", "agar.io", "krunker.io", "diep.io", "skribbl.io", "shellshock.io", "zombsroyale.io",
+  "chess.com", "www.chess.com", "lichess.org",
+  "geoguessr.com", "www.geoguessr.com",
+]
+lists = []
+url_block = [
+  "poki.com", "crazygames.com", "coolmathgames.com", "miniclip.com", "kongregate.com",
+  "armorgames.com", "y8.com", "friv.com", "agame.com", "addictinggames.com", "iogames.space",
+  "slither.io", "agar.io", "krunker.io", "diep.io", "skribbl.io", "shellshock.io", "zombsroyale.io",
+  "chess.com", "lichess.org", "geoguessr.com",
+  "nytimes.com/games", "nytimes.com/crosswords",   # Wordle, Connections, the crossword (paths: policy only)
+]
+url_allow = []
+webapp_classes = ['^chrome-(www\.)?(poki\.com|crazygames\.com|chess\.com|lichess\.org|geoguessr\.com)__']
+title_patterns = [
+  '(?i)(?:^|(?<=^\(\d\) )|(?<=^\(\d\d\) )|(?<=^\(\d\d\d\) )|(?<=[-—–|•·] ))(?:Poki|CrazyGames(?:\.com)?|Coolmath Games|Miniclip|Kongregate|Armor Games|Y8(?:\.com)?|Friv(?:\.com)?|GeoGuessr|Chess\.com|lichess\.org)(?=(?: [-—–] (?:Vivaldi|Chromium|Google Chrome|Brave|(?:Mozilla )?Firefox)\b[^-—–|]*)?$)',   # portal as the whole title or last segment
+  '(?i)(?:^|(?<=^\(\d\) )|(?<=^\(\d\d\) )|(?<=^\(\d\d\d\) ))(?:Poki|CrazyGames(?:\.com)?|Coolmath Games|Miniclip|Kongregate|Armor Games|Y8(?:\.com)?|Friv(?:\.com)?|GeoGuessr|Chess\.com|lichess\.org)(?=(?: [-—–|•·]|:) )(?!.*[-—–|] (?:Wikipedia|Wiktionary|Google Search|Hledat Googlem|Vyhledat Googlem|DuckDuckGo|Bing|GitHub|Stack Overflow)\b)',   # "Poki - Free Online Games", "lichess.org • …"
+  '(?i)(?<= on )(?:Poki|CrazyGames(?:\.com)?|Coolmath Games|Miniclip|Kongregate|Armor Games|Y8(?:\.com)?|Friv(?:\.com)?|GeoGuessr|Chess\.com|lichess\.org)(?=(?: [-—–] (?:Vivaldi|Chromium|Google Chrome|Brave|(?:Mozilla )?Firefox)\b[^-—–|]*)?$)',   # "Play Slither.io on CrazyGames"
+  '(?i)(?:^|(?<=^\(\d\) )|(?<=^\(\d\d\) )|(?<=^\(\d\d\d\) )|(?<=[-—–|•·] ))(?:(?:slither|agar|diep|shellshock|zombsroyale)\.io|Krunker(?:\.io)?|skribbl(?:\.io)?)(?=(?: [-—–] (?:Vivaldi|Chromium|Google Chrome|Brave|(?:Mozilla )?Firefox)\b[^-—–|]*)?$)',   # .io games as the title / last segment
+  '(?i)(?:^|(?<=^\(\d\) )|(?<=^\(\d\d\) )|(?<=^\(\d\d\d\) ))(?:(?:slither|agar|diep|shellshock|zombsroyale)\.io|Krunker(?:\.io)?|skribbl(?:\.io)?)(?=(?: [-—–|•·]|:) )(?!.*[-—–|] (?:Wikipedia|Wiktionary|Google Search|Hledat Googlem|Vyhledat Googlem|DuckDuckGo|Bing|GitHub|Stack Overflow)\b)',   # "skribbl - Free Multiplayer …"
+  '(?:^|(?<=^\(\d\) )|(?<=^\(\d\d\) )|(?<=^\(\d\d\d\) ))(?:(?:The|Play|Daily) )?(?:Wordle|Connections|Strands|Spelling Bee|(?:Mini )?Crossword|Sudoku|Letter Boxed|Tiles)\b[^-—–|]*[-—–|] (?:.*[-—–|] )?The New York Times(?=(?: [-—–] (?:Vivaldi|Chromium|Google Chrome|Brave|(?:Mozilla )?Firefox)\b[^-—–|]*)?$)',   # NYT game name first, NYT suffix last (case-sensitive)
+  '(?:^|(?<=^\(\d\) )|(?<=^\(\d\d\) )|(?<=^\(\d\d\d\) ))(?:NYT|New York Times) Games\b',   # "NYT Games …"
+]
+
+[groups.minecraft]
+label = "Minecraft (online)"
+enabled = false            # Off (Approved by Theo 2026-11-10). On = login and multiplayer fail (single-player may still start offline).
+unlockable = true
+max_minutes = 20
+hosts = [
+  "api.minecraftservices.com", "sessionserver.mojang.com", "authserver.mojang.com",
+  "api.mojang.com", "pc.realms.minecraft.net",
+]
+lists = []
+url_block = ["minecraft.net"]
+url_allow = []
+webapp_classes = []        # the bar plugin closes these on re-lock; the game isn't a web app
+title_patterns = []        # title patterns only apply to browser/web-app windows; the game is native
+
+[groups.porn]
+label = "Porn"
+enabled = true
+unlockable = false         # no unlocks, no judge call. Approved by Theo 2026-11-10
+hosts = [                  # a few big names, so the block works before the first list download
+  "pornhub.com", "www.pornhub.com", "xvideos.com", "www.xvideos.com", "xnxx.com", "www.xnxx.com",
+  "xhamster.com", "www.xhamster.com", "onlyfans.com", "www.onlyfans.com",
+  "chaturbate.com", "www.chaturbate.com", "spankbang.com", "www.spankbang.com",
+]
+lists = ["porn"]
+url_block = [              # subdomains and country mirrors in the browsers
+  "pornhub.com", "xvideos.com", "xnxx.com", "xhamster.com", "onlyfans.com", "chaturbate.com",
+  "spankbang.com", "redtube.com", "youporn.com", "stripchat.com", "eporner.com", "rule34.xxx",
+]
+url_allow = []
+webapp_classes = []
+title_patterns = [
+  '(?i)(?:^|(?<=^\(\d\) )|(?<=^\(\d\d\) )|(?<=^\(\d\d\d\) )|(?<=[-—–|•·] ))(?:Pornhub(?:\.com)?|XVIDEOS(?:\.COM)?|XNXX(?:\.COM)?|xHamster|OnlyFans|Chaturbate|SpankBang|RedTube|YouPorn|Stripchat|Eporner)(?=(?: [-—–] (?:Vivaldi|Chromium|Google Chrome|Brave|(?:Mozilla )?Firefox)\b[^-—–|]*)?$)',
+  '(?i)(?:^|(?<=^\(\d\) )|(?<=^\(\d\d\) )|(?<=^\(\d\d\d\) ))(?:Pornhub(?:\.com)?|XVIDEOS(?:\.COM)?|XNXX(?:\.COM)?|xHamster|OnlyFans|Chaturbate|SpankBang|RedTube|YouPorn|Stripchat|Eporner)(?=(?: [-—–|•·]|:) )(?!.*[-—–|] (?:Wikipedia|Wiktionary|Google Search|Hledat Googlem|Vyhledat Googlem|DuckDuckGo|Bing|GitHub|Stack Overflow)\b)',
+]
+
+# ---------------------------------------------------------------- screen monitor
+[watch]
+mode = "observe"           # off | observe (log only) | nudge (+ notifications) | enforce (+ hide/freeze/block)
+title_interval_seconds = 60
+vision_interval_seconds = [180, 420]
+vision_min_battery_percent = 15
+ollama_url = "http://127.0.0.1:11434"
+model = "qwen3.5:4b"
+image_max_width = 1024
+num_ctx = 4096
+vision_timeout_seconds = 60
+min_confidence = 0.8
+notify_after = 2
+enforce_after = 3
+penalty_minutes = 30
+max_active_penalties = 10
+
+# Full browsers: never hidden or frozen (that would hide work tabs); in enforce
+# mode the caught domain is blocked instead. Vivaldi's class is vivaldi-stable.
+browser_classes = ['^vivaldi', '^chromium$', '^firefox', '^google-chrome', '^brave-browser']
+
+# Native apps that get SIGSTOP (plus hidden) on enforcement: none for now.
+# Hyprland's "application not responding" dialog (misc:enable_anr_dialog) would
+# pop up over a stopped game and offer Terminate, i.e. lost progress. For later:
+#   freeze_classes = ['^Minecraft\*? \d', '^steam_app_']
+# (the game window's class is its title, "Minecraft 26.3" / "Minecraft* 26.3",
+# GLFW under XWayland, not verified live; '(?i)^minecraft' would also have
+# matched the launcher, class minecraft-launcher.)
+freeze_classes = []
+
+# Never hidden or frozen, and counted as "working" by the title step:
+# terminals (Claude Code runs in org.omarchy.claude), editors, the shell itself,
+# password/auth prompts and call apps.
+never_touch_classes = [
+  '^Alacritty$', '^foot$', '^footclient$', '^org\.codeberg\.dnkl\.foot$', '^kitty$',
+  '^com\.mitchellh\.ghostty$', '^org\.kde\.konsole$', '^konsole$',
+  '^org\.omarchy\.terminal$',   # the floating terminal for `focus unlock/appeal --pause` (bar plugin, Super+Alt+U)
+  '^org\.omarchy\.', '^TUI\.',   # Omarchy TUIs and terminals, incl. org.omarchy.claude
+  '^code', '^com\.microsoft\.VSCode$', '^obsidian$', '^md\.obsidian\.Obsidian$',
+  '^org\.quickshell$', '(?i)polkit', '(?i)pinentry', '^gcr-prompter$', '^xdg-desktop-portal',
+  '(?i)^zoom', '^teams-for-linux$', '^chrome-app\.zoom\.us__', '^chrome-teams\.microsoft\.com__',
+]
+
+# More apps the title step counts as "working" (installed here, checked 2026-11-10).
+work_classes = [
+  '^libreoffice', '^soffice$',                                   # LibreOffice (writer/calc/impress/...)
+  '^sioyek$', '^org\.gnome\.Papers$', '^papers$', '^org\.gnome\.Evince$', '^evince$',
+  '^masterpdfeditor5$',                                          # PDF viewers/editors
+  '(?i)^zotero$', '^com\.github\.xournalpp\.xournalpp$', '^org\.inkscape\.Inkscape$',
+  '^omawrite$', '^omacalc$', '^org\.gnome\.Nautilus$',
+  '^chrome-claude\.ai__', '^chrome-www\.onenote\.com__', '^chrome-outlook\.office\.com__',
+  '^chrome-app\.todoist\.com__', '^chrome-onedrive\.live\.com__',   # work web apps
+  '^chrome-chatgpt\.com__', '^chrome-chat\.openai\.com__',          # ChatGPT web app (Theo: counts as work, 2026-11-10)
+]
+
+# Window titles counted as "working" (checked after the distraction patterns).
+work_title_patterns = [
+  '(?i)\barxiv\b',
+  '(?i)\bOverleaf\b',
+  '(?i)\.pdf\b',                                       # PDFs open in the browser or a viewer
+  '(?i)\b(bioRxiv|medRxiv|PubMed|PMC|Europe PMC|Google Scholar|Semantic Scholar|ScienceDirect|SpringerLink|Wiley Online Library|PLOS|Ensembl|UniProt|NCBI|Bioconductor|CRAN)\b',
+  '(?i) \| Nature( [A-Z][a-z]+)*( [-—–] [^-—–]+)?$',   # "<article> | Nature Immunology - Vivaldi"
+  '(?i)\bdocumentation\b|\bRead the Docs\b|\bAPI reference\b',
+  ' \| MDN( Web Docs)?\b',
+  '(?i)\bStack Overflow\b',
+  '(?i)( · |^)GitHub( [-—–] [^-—–]+)?$|^GitHub - ',    # GitHub repos, issues, PRs
+  '(?i)( [-—–] |^)Claude( [-—–] [^-—–]+)?$',           # claude.ai chats
+  '(?i)( [-—–] |^)ChatGPT( [-—–] [^-—–]+)?$',          # chatgpt.com chats (Theo: counts as work)
+  '(?i) - Google (Docs|Sheets|Slides|Drive)\b',
+  '(?i)\bJupyter(Lab)?\b',
+  '(?i)\b(Canvas|Moodle)\b',                          # university learning platforms (VLEs)
+  # '(?i)\b(Your University|your-university\.ac\.uk)\b',   # your university's own sites
+  '(?i)\b(Outlook|Microsoft Teams|OneNote|SharePoint|OneDrive)\b',
+  '(?i)\blocalhost(:\d+)?\b',
+]
+
+# Browser/web-app titles counted as "procrastinating" for sites no group blocks. Approved by Theo 2026-11-10 (all).
+distraction_title_patterns = [
+  '(?i)(?:^|(?<=^\(\d\) )|(?<=^\(\d\d\) )|(?<=^\(\d\d\d\) )|(?<=[-—–|•·] ))(?:Hacker News)(?=(?: [-—–] (?:Vivaldi|Chromium|Google Chrome|Brave|(?:Mozilla )?Firefox)\b[^-—–|]*)?$)',   # "Hacker News", "<story> | Hacker News - Vivaldi"
+  '(?i)(?:^|(?<=^\(\d\) )|(?<=^\(\d\d\) )|(?<=^\(\d\d\d\) )|(?<=[-—–|•·] ))(?:Netflix|Twitch|Facebook|TikTok|9GAG|Imgur|Tumblr|Pinterest)(?=(?: [-—–] (?:Vivaldi|Chromium|Google Chrome|Brave|(?:Mozilla )?Firefox)\b[^-—–|]*)?$)',   # social/video sites as the title or last segment
+  '(?i)(?:^|(?<=^\(\d\) )|(?<=^\(\d\d\) )|(?<=^\(\d\d\d\) ))(?:Netflix|Twitch|Facebook|TikTok|9GAG|Imgur|Tumblr|Pinterest)(?=(?: [-—–|•·]|:) )(?!.*[-—–|] (?:Wikipedia|Wiktionary|Google Search|Hledat Googlem|Vyhledat Googlem|DuckDuckGo|Bing|GitHub|Stack Overflow)\b)',   # "TikTok - Make Your Day", "Imgur: …"
+  '(?i)(?:^|(?<=^\(\d\) )|(?<=^\(\d\d\) )|(?<=^\(\d\d\d\) )|(?<=[-—–|•·] ))(?:Prime Video|Disney\+|HBO Max|Crunchyroll|SkyShowtime|Voyo)(?=(?: [-—–] (?:Vivaldi|Chromium|Google Chrome|Brave|(?:Mozilla )?Firefox)\b[^-—–|]*)?$)',   # streaming as the title or last segment
+  '(?i)(?:^|(?<=^\(\d\) )|(?<=^\(\d\d\) )|(?<=^\(\d\d\d\) ))(?:Prime Video|Disney\+|HBO Max|Crunchyroll|SkyShowtime|Voyo)(?=(?: [-—–|•·]|:) )(?!.*[-—–|] (?:Wikipedia|Wiktionary|Google Search|Hledat Googlem|Vyhledat Googlem|DuckDuckGo|Bing|GitHub|Stack Overflow)\b)',   # "Prime Video: <show>"
+  '(?i)(?<=[-—–|] )(?:iDNES\.cz|Novinky\.cz|Seznam Zprávy|Aktuálně\.cz|iROZHLAS|Deník N)(?=(?: [-—–|] [^-—–|]+)?(?: [-—–] (?:Vivaldi|Chromium|Google Chrome|Brave|(?:Mozilla )?Firefox)\b[^-—–|]*)?$)',   # Czech news as the last segment (+ one tagline)
+  '(?i)(?:^|(?<=^\(\d\) )|(?<=^\(\d\d\) )|(?<=^\(\d\d\d\) ))(?:iDNES\.cz|Novinky\.cz|Seznam Zprávy|Aktuálně\.cz|iROZHLAS|Deník N)(?=(?: [-—–|•·]|:) )(?!.*[-—–|] (?:Wikipedia|Wiktionary|Google Search|Hledat Googlem|Vyhledat Googlem|DuckDuckGo|Bing|GitHub|Stack Overflow)\b)',   # Czech news first
+  '(?i)(?<=[-—–|] )(?:BBC News|BBC Sport|The Guardian|CNN(?: (?:Politics|Business|Travel|Health|Style|Sport|Sports|Underscored|International))?)(?=(?: [-—–] (?:Vivaldi|Chromium|Google Chrome|Brave|(?:Mozilla )?Firefox)\b[^-—–|]*)?$)',   # "… | CNN Politics", "… - BBC News"
+]

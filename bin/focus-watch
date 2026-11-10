@@ -1,0 +1,32 @@
+#!/usr/bin/python3 -I
+# focus-watch launcher → focus.watch:main
+# focus-watch, the screen monitor (run by the focus-watch user unit)
+#
+# Installed copy: imports the package from /usr/local/lib/focus (install.sh).
+# Development: FOCUS_DEV=1 python3 -I bin/focus-watch ...  imports from this repo instead
+# (and writes no __pycache__ into the Nextcloud tree).
+import os
+import sys
+
+_LIB = "/usr/local/lib/focus"
+
+if os.environ.get("FOCUS_DEV") == "1":
+    _repo = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    if not os.path.isfile(os.path.join(_repo, "focus", "__init__.py")):
+        sys.exit("focus-watch: FOCUS_DEV=1 but no focus package next to " + os.path.realpath(__file__))
+    sys.dont_write_bytecode = True
+    _LIB = _repo
+
+sys.path.insert(0, _LIB)
+
+# -I ignores PYTHONUNBUFFERED; keep log lines prompt under systemd/journald.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
+
+from focus.watch import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

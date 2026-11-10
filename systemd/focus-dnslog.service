@@ -1,0 +1,21 @@
+# /etc/systemd/system/focus-dnslog.service — installed by install.sh
+[Unit]
+Description=focus DNS activity log (resolvectl monitor → /var/log/focus/dns)
+Documentation=file:///home/theo/nextcloud/code/focus/README.md
+After=systemd-resolved.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/focus/focus-dnslog
+Restart=always
+RestartSec=5
+Nice=5
+# Logs only; it blocks nothing. Light sandbox: read-only /usr, /boot, /etc
+# (/var/log stays writable), no home access.
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

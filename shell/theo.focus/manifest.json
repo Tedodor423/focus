@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "theo.focus",
+  "name": "Focus",
+  "version": "0.1.0",
+  "author": "theo",
+  "license": "MIT",
+  "description": "Bar item for the focus blocker: lock state, running unlocks and penalties, a warning when focusd or the screen monitor is down, and the full-screen penalty overlay. Polls `focus status --json` every 10 s.",
+  "kinds": [
+    "service",
+    "bar-widget",
+    "overlay"
+  ],
+  "keepLoaded": false,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml",
+    "overlay": "Overlay.qml"
+  },
+  "barWidget": {
+    "displayName": "Focus",
+    "description": "Focus blocker: locked groups, unlock countdown, penalties. Click to unlock, right-click to lock all.",
+    "category": "Plugin",
+    "aliases": ["focus", "blocker", "procrastination", "unlock"],
+    "allowMultiple": false,
+    "defaultSection": "centerEnd",
+    "defaults": {},
+    "schema": []
+  }
+}
