@@ -10,7 +10,7 @@ import os
 import subprocess
 import sys
 
-from . import paths
+from . import extension, paths
 from .config import overlaps_any, under_any
 
 BEGIN = "# BEGIN focus — managed by focusd, manual edits are reverted"
@@ -145,6 +145,13 @@ def policy_json(cfg, locked, penalty_domains) -> bytes:
         obj["DnsOverHttpsMode"] = "off"
     if cfg.browser.force_google_safesearch:
         obj["ForceGoogleSafeSearch"] = True
+    built = extension.installed()
+    if built:
+        ext_id, update_url = built
+        obj["ExtensionInstallForcelist"] = [f"{ext_id};{update_url}"]
+        # Incognito refuses to load pages until the extension is allowed there.
+        obj["MandatoryExtensionsForIncognitoNavigation"] = [ext_id]
+        obj["3rdparty"] = {"extensions": {ext_id: {"block": block, "allow": allow}}}
     return (json.dumps(obj, indent=2, ensure_ascii=False) + "\n").encode()
 
 

@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Locked</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; font: 16px/1.5 system-ui, sans-serif; background: Canvas; color: CanvasText; }
+  main { max-width: 32rem; padding: 2rem; text-align: center; }
+  h1 { font-size: 1.5rem; font-weight: 600; margin: 0 0 .5rem; overflow-wrap: anywhere; }
+  p { margin: .25rem 0; opacity: .75; }
+  code { font-size: .95em; }
+  button { margin-top: 1rem; padding: .4rem 1rem; font: inherit; }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="site">This site</h1>
+  <p>is locked right now.</p>
+  <p>Need it? Run <code>focus unlock</code>. This tab comes back on its own once it's unlocked.</p>
+  <button id="back" type="button" hidden>Go back</button>
+</main>
+<script type="module" src="blocked.js"></script>
+</body>
+</html>

@@ -53,6 +53,9 @@ class RootInstallTests(unittest.TestCase):
         shutil.copy(local_or_example("etc/judge.md", "etc/judge.example.md"), os.path.join(r, "etc/judge.md"))
         for m in ("__init__", "cli", "daemon", "watch", "render"):
             self.write(os.path.join(r, "focus", m + ".py"), STUB)
+        for m in ("paths.py", "extension.py"):
+            shutil.copy(os.path.join(REPO, "focus", m), os.path.join(r, "focus", m))
+        shutil.copytree(os.path.join(REPO, "extension"), os.path.join(r, "extension"))
 
     def make_root(self):
         os.makedirs(os.path.join(self.root, "etc", "chromium", "policies", "managed"))
@@ -306,6 +309,24 @@ class RootInstallTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         with open(self.p("etc/hosts"), "rb") as f:
             self.assertEqual(f.read(), HOSTS + stray_before + tail)
+
+    def test_install_builds_the_browser_extension(self):
+        self.install()
+        d = self.p("var/lib/focus/extension")
+        self.assertEqual(mode(os.path.join(d, "key.pem")), 0o600)
+        for name in ("focus-guard.crx", "update.xml", "id"):
+            self.assertEqual(mode(os.path.join(d, name)), 0o644, name)
+        with open(os.path.join(d, "id")) as f:
+            first = f.read()
+        self.install()
+        with open(os.path.join(d, "id")) as f:
+            self.assertEqual(f.read(), first, "a reinstall keeps the extension id")
+
+    def test_a_failed_extension_build_only_warns(self):
+        shutil.rmtree(os.path.join(self.repo, "extension"))
+        out = self.install()
+        self.assertFalse(os.path.exists(self.p("var/lib/focus/extension/id")))
+        self.assertIsNotNone(out)
 
     def test_uninstall_uses_focusd_split_hosts_when_available(self):
         real_pkg = os.path.join(REPO, "focus")

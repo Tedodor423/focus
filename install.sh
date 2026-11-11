@@ -16,6 +16,7 @@
 #   /etc/systemd/user/focus-watch.service                      (systemctl --global enable)
 #   /var/lib/focus/{lists,judge}/, /var/log/focus/dns/ (root:<user> 0750)
 #   /var/lib/focus/hosts.orig         one-time copy of /etc/hosts, never overwritten
+#   /var/lib/focus/extension/         the signed browser extension and its machine-local key
 # It never edits /etc/hosts or the browser policy dirs itself (focusd does, and
 # only its own block and focus.json; Omarchy's color.json/omarchy.json are never
 # touched). Ollama is only checked, never installed or changed.
@@ -39,7 +40,7 @@ for arg in "$@"; do
     --no-start) NO_START=1 ;;
     --purge) PURGE=1 ;;
     --force) FORCE=1 ;;
-    -h|--help) sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "focus install: unknown option: $arg" >&2; exit 2 ;;
   esac
 done
@@ -210,7 +211,7 @@ PY
     say "purging state and logs"
     rm -rf -- "${VAR:?}" "${LOG:?}"
   else
-    echo "  kept $VAR (state, events.jsonl, hosts.orig, backups) and $LOG (DNS log); --purge removes them"
+    echo "  kept $VAR (state, events.jsonl, hosts.orig, backups, extension key) and $LOG (DNS log); --purge removes them"
   fi
   [ "$rc" -eq 0 ] && say "focus root part uninstalled" || warn "uninstall finished with errors (see above)"
   return "$rc"
@@ -297,6 +298,16 @@ for f in "$LIB"/focus/*.py; do
   [ -f "$REPO/focus/$(basename "$f")" ] || { rm -f -- "$f"; echo "  removed stale $(basename "$f")"; }
 done
 rm -rf -- "$LIB/focus/__pycache__"
+
+# Open tabs are only re-locked with this; everything else works without it.
+if ext_id=$(FOCUS_ROOT="$ROOT" python3 -I -B -c 'import sys
+sys.path.insert(0, sys.argv[1])
+from focus import extension
+print(extension.build(sys.argv[2]))' "$LIB" "$REPO/extension"); then
+  echo "  browser extension built ($ext_id)"
+else
+  warn "could not build the browser extension (is openssl installed?); open tabs won't re-lock on their own"
+fi
 
 install -m 0755 "$REPO/dnslog/focus-dnslog" "$LIB/focus-dnslog"
 install -m 0755 "$REPO/bin/focus" "$BIN/focus"

@@ -168,6 +168,12 @@ malformed it leaves `/etc/hosts` alone and says so; the pre-install copy is
 ~/.local/state/focus/                  watch.json, backups/
 ```
 
+## Browser extension
+
+The blocker can only stop a page from loading, so the installer also forces a small extension into Chromium and Vivaldi. About 5 seconds after a site locks, any tab open on it is replaced with a "locked" page, and that tab goes back to the site when it's unlocked.
+
+Incognito needs one manual step per browser, because no policy can grant it: open `chrome://extensions` (Vivaldi: `vivaldi://extensions`), choose focus guard, then Details, and turn on "Allow in Incognito". Until that's done, incognito refuses to load pages in that browser. `uninstall --purge` deletes the signing key, so the next install gets a new extension id and needs this step again.
+
 ## Development
 
 The repo lives on NTFS (`~/nextcloud` → `/mnt/windows`): no exec bits or symlinks

@@ -412,6 +412,15 @@ All model output is stripped of lone surrogates and control characters before it
 
 **Monitor (E):** treat status groups with `learned: true` as groups too (using their status `title_patterns`/`webapp_classes`/`url_block`), locked or unlocked per status. Remember the learned group ids in watch.json and send `notify-send "Focus" "Now blocked: <label>. Remove: focus learned remove <domain>"` for each new one (first run: only record, no notification).
 
+## 14. Browser extension: re-locking open tabs (`extension/`, `focus/extension.py`)
+
+URLBlocklist and the hosts file only act when a page loads, so a tab left open keeps working after an unlock ends. `extension/` closes that gap in Chromium and Vivaldi.
+
+- **Delivery.** `install.sh` packs `extension/` into a CRX3 signed with a key generated on this machine (`/var/lib/focus/extension/key.pem`, 0600), so the id survives reinstalls. `render.policy_json` adds `ExtensionInstallForcelist` (a `file://` update URL) when a build exists; without one the policy is unchanged. Browsers keep the old copy unless `version` in `extension/manifest.json` goes up.
+- **Data.** focusd writes the final `block`/`allow` lists to `3rdparty.extensions.<id>` in the same `focus.json` as URLBlocklist, so learned sites and penalties are included. The extension reads them from `chrome.storage.managed`. Chromium applies a policy file about 5 s after it changes.
+- **Behaviour.** On a managed-storage change, browser start and a 1-minute alarm, tabs whose address is locked go to `blocked.html`, which returns to the address when it unlocks. `tabs.onUpdated` catches in-page navigation that never reaches URLBlocklist. `blocked.html` has a "Go back" button that steps over the locked history entry, since the browser's own Back lands on that entry and returns to `blocked.html`. `filters.mjs` mirrors Chromium's filter format and precedence. A block filter with a query is left to the browser; an allow filter with one is matched on host and path, because replacing a permitted page is the worse mistake.
+- **Incognito.** Browsers run an extension there only if the user allows it per browser, and no policy can grant that. `MandatoryExtensionsForIncognitoNavigation` makes incognito refuse to load pages until it is allowed. The manifest uses `"incognito": "split"` because a spanning extension cannot load its own page in an incognito tab.
+
 ## 11. Hard safety rules for every agent
 
 - **No sudo, pkexec or root**, and no writes to `/etc`, `/usr`, `/var` or `/run`. Installation happens later, by the lead, with Theo's approval. Test everything under a `FOCUS_ROOT` temp dir.

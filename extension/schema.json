@@ -1,0 +1,7 @@
+{
+  "type": "object",
+  "properties": {
+    "block": { "type": "array", "items": { "type": "string" } },
+    "allow": { "type": "array", "items": { "type": "string" } }
+  }
+}
