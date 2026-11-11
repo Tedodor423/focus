@@ -527,6 +527,7 @@ class State:
         self.hidden: list[dict] = []
         self.dup_notified: list[str] = []  # penalty ids already re-announced (no duplicate penalties)
         self.penalized: list[dict] = []    # {id, class, stem, until} of penalties this monitor created
+        self.learned: list[str] | None = None  # learned group ids already seen; None = never recorded
 
     def load(self) -> None:
         try:
@@ -544,6 +545,8 @@ class State:
         self.notified = d.get("notified") is True
         dn = d.get("dup_notified")
         self.dup_notified = [x for x in dn if isinstance(x, str)] if isinstance(dn, list) else []
+        ln = d.get("learned")
+        self.learned = [x for x in ln if isinstance(x, str)] if isinstance(ln, list) else None
         pz = d.get("penalized")
         self.penalized = [x for x in pz if isinstance(x, dict) and x.get("id")] if isinstance(pz, list) else []
         nv = d.get("next_vision_at")
@@ -556,7 +559,8 @@ class State:
         os.makedirs(d, mode=0o700, exist_ok=True)
         data = json.dumps({"version": 1, "streak": self.streak, "notified": self.notified,
                            "next_vision_at": self.next_vision_at, "hidden": self.hidden,
-                           "dup_notified": self.dup_notified[-50:], "penalized": self.penalized[-50:]},
+                           "dup_notified": self.dup_notified[-50:], "penalized": self.penalized[-50:],
+                           "learned": self.learned},
                           indent=1).encode()
         fd, tmp = tempfile.mkstemp(prefix=".watch.", suffix=".tmp", dir=d)
         try:
@@ -757,6 +761,27 @@ class Watcher:
         self.state.hidden = [h for h in self.state.hidden if id(h) not in done]
         self.save_state()
 
+    def note_learned(self, status: dict) -> None:
+        """One notification per newly learned site. With nothing recorded yet, only record. Ids are never
+        forgotten, so a status that briefly lacks them can't cause a burst of repeats."""
+        if self.once and not self.dry_run:
+            return  # --once sends no real notifications, and must not use this one up
+        current = [sg for sg in status.get("groups") or [] if isinstance(sg, dict) and sg.get("learned") is True
+                   and sg.get("enabled", True) is not False and isinstance(sg.get("id"), str)]
+        first = self.state.learned is None
+        known = set(self.state.learned or [])
+        new = [sg for sg in current if sg["id"] not in known]
+        if not first and not new:
+            return
+        if not first:
+            for sg in new:
+                label = str(sg.get("label") or sg["id"])
+                hosts = [u for u in sg.get("url_block") or [] if isinstance(u, str) and u]
+                hint = f" Remove: focus learned remove {hosts[0]}" if hosts else ""
+                self.notify("normal", f"Now blocked: {label}.{hint}")
+        self.state.learned = (self.state.learned or []) + [sg["id"] for sg in new]
+        self.save_state()
+
     def _restore_target(self, e: dict) -> str:
         name, wid = e.get("workspace"), e.get("workspace_id")
         if name == JAIL or not (name or (isinstance(wid, int) and wid >= 1)):
@@ -824,7 +849,9 @@ class Watcher:
                 disabled.add(sg["id"])
             elif sg.get("locked") is False:
                 unlocked.add(sg["id"])
-            if sg["id"] not in known and GROUP_ID_RE.match(sg["id"]):
+            learned = sg.get("learned") is True
+            if (learned or sg["id"] not in known) and GROUP_ID_RE.match(sg["id"]):
+                groups = [g for g in groups if g.id != sg["id"]]
                 groups.append(Group(
                     sg["id"], str(sg.get("label") or sg["id"]), sg.get("enabled", True) is not False,
                     compile_patterns(sg.get("webapp_classes") or [], f"status {sg['id']} webapp_classes"),
@@ -1239,6 +1266,7 @@ class Watcher:
             log(f"daemon unreachable: {e}")
         if live is not None:
             self._cache = (now, live)
+            self.note_learned(live)  # before the mode check: the site is blocked whatever the monitor's mode
         # Unreachable: the last good status still says what's unlocked, for a while; then it's unknown.
         view = live
         if view is None and self._cache and now - self._cache[0] <= STATUS_CACHE_SECONDS:

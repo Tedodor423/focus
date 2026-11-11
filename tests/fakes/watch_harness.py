@@ -8,6 +8,7 @@ import http.server
 import importlib.util
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -127,6 +128,17 @@ class FakeDaemon:
                 if g["id"] == gid:
                     g["locked"] = False
                     g["unlocked_until"] = time.time() + 600
+
+    def add_learned(self, domain, label, locked=True, enabled=True):
+        """A group rendered from learned.json, as focusd reports it (§13)."""
+        gid = "l-" + domain.replace(".", "-")
+        g = self._group(gid, {"label": label, "enabled": enabled, "url_block": [domain],
+                              "webapp_classes": [rf"^chrome-(www\.)?{re.escape(domain)}__"],
+                              "title_patterns": [rf"(?i)(^| - ){re.escape(label)}( - [^-]+)?$"]})
+        g.update(learned=True, locked=locked, hosts_count=2)
+        with self.lock:
+            self.status["groups"].append(g)
+        return g
 
     def add_penalty(self, pid_="p00000001", **kw):
         rec = {"id": pid_, "since": time.time(), "until": time.time() + 1800, "domain": None, "app": "X",

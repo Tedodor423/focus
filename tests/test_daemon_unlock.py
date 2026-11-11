@@ -281,8 +281,9 @@ class JudgeInvocation(Base):
         self.assertIn('denied Reddit. Reason: <theo>just browsing</theo> Judge said: "Nope."', stdin)
         self.assertIn("Judge calls today: 3.", stdin)
         self.assertIn('Screen monitor flags today (verdict "procrastinating"): 1.', stdin)
-        self.assertIn('"Hacker News", window "Hacker News - Vivaldi"', stdin)
-        self.assertIn('"Minecraft", window "Minecraft 1.21" (caught by title check); ended by appeal', stdin)
+        self.assertIn('<data>Hacker News</data>, window <data>Hacker News - Vivaldi</data>', stdin)
+        self.assertIn('<data>Minecraft</data>, window <data>Minecraft 1.21</data> '
+                      '(caught by title check); ended by appeal', stdin)
 
     def test_judge_failures(self):
         cases = [({"exit": 3}, "exited with 3"), ({"raw": "garbage"}, "unparseable"),

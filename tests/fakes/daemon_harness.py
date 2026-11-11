@@ -131,10 +131,11 @@ class Daemon:
     def path(self, p):
         return self.root + p
 
-    def config_text(self, user=None, reconcile=30, calls=8, timeout=10, watch_mode="enforce"):
+    def config_text(self, user=None, reconcile=30, calls=8, timeout=10, watch_mode="enforce",
+                    learn=""):
         return CONFIG.format(user=user or getpass.getuser(), reconcile=reconcile, calls=calls,
                              timeout=timeout, watch_mode=watch_mode, python=sys.executable,
-                             fake=FAKE, script=self.script)
+                             fake=FAKE, script=self.script) + learn
 
     def write_config(self, text=None, **cfg):
         with open(self.path("/etc/focus/config.toml"), "w") as f:
@@ -166,6 +167,14 @@ class Daemon:
     def state(self):
         with open(self.path("/var/lib/focus/state.json")) as f:
             return json.load(f)
+
+    def read_json(self, name):
+        with open(self.path(f"/var/lib/focus/{name}")) as f:
+            return json.load(f)
+
+    def write_json(self, name, data):
+        with open(self.path(f"/var/lib/focus/{name}"), "w") as f:
+            json.dump(data, f)
 
     def write_state(self, data):
         with open(self.path("/var/lib/focus/state.json"), "w") as f:

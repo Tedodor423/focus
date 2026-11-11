@@ -97,7 +97,7 @@ class Penalize(Base):
             "docs.example.net", "news.ycombinator.com", "www.x.example")])
         d.start()
         cases = [("ac.uk", "too_broad"), ("co.uk", "too_broad"), ("github.io", "too_broad"),
-                 ("example.net", "never_block"), ("example.ac.uk", "never_block"),
+                 ("example.net", "never_block"), ("example.ac.uk", "too_broad"),
                  ("ycombinator.com", "not_in_dnslog")]
         for domain, why in cases:
             r = d.request(pen(domain))
@@ -195,9 +195,9 @@ class Appeals(Base):
         self.assertEqual((v["penalty"], v["decision"], v["session"]), (pid, "grant", r["session"]))
         stdin = d.judge_calls()[0]["stdin"]
         self.assertIn("Was this actually work or a necessary short break?", stdin)
-        self.assertIn('- app: "Hacker News"', stdin)
-        self.assertIn('- window title: "Hacker News - Vivaldi"', stdin)
-        self.assertIn('- description: "a news aggregator"', stdin)
+        self.assertIn('- app: <data>Hacker News</data>', stdin)
+        self.assertIn('- window title: <data>Hacker News - Vivaldi</data>', stdin)
+        self.assertIn('- description: <data>a news aggregator</data>', stdin)
         self.assertIn("- detected by: vision check", stdin)
         self.assertIn("- penalty time left: 30 min", stdin)
         self.assertIn("<theo>I was reading a paper on HN.</theo>", stdin)

@@ -20,10 +20,10 @@ import threading
 import time
 import traceback
 
-from . import config, judge, paths, render, version
+from . import config, judge, learn, paths, render, version
 from .config import penalty_domain, under_any, url_host
 from .lists import Lists, dnslog_check
-from .state import EventLog, State, day_start, hhmm, next_day_start
+from .state import EventLog, State, day_start, hhmm, next_day_start, scrub
 
 SESSION_TTL = 600
 MAX_REQUEST = 64 * 1024
@@ -31,15 +31,15 @@ IO_TIMEOUT = 10
 VERDICTS = {"working", "procrastinating", "unclear", "allowed", "idle", "undecided", "error"}
 OBSERVE_SOURCES = {"title", "vision", "unlock", "idle"}
 PENALTY_SOURCES = {"title", "vision"}
-JUDGE_CALL_EVENTS = {"request", "followup", "appeal"}
+JUDGE_CALL_EVENTS = {"request", "followup", "appeal", "learn_remove_request"}
 
 
 class Fail(Exception):
     """An error response: {"ok": false, "error": code, "message": message}."""
 
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, **extra):
         super().__init__(message)
-        self.code, self.message = code, message
+        self.code, self.message, self.extra = code, message, extra
 
 
 def _err(code, message):
@@ -88,7 +88,9 @@ class Daemon:
     def __init__(self):
         self.lock = threading.RLock()
         self.events = EventLog(paths.events_file())
-        self.cfg = None
+        self.cfg = None              # the config plus the learned sites as groups
+        self.base_cfg = None         # the config as loaded from disk
+        self.learn = learn.Learner(self)
         self.state = State()
         self.sessions = {}
         self.lists = Lists(self.log, self.reconcile)
@@ -127,7 +129,16 @@ class Daemon:
 
     def health(self):
         return self.writer.health() + [h for h in (self.config_problem, self.policy_problem,
-                                                   self.judge_problem) if h]
+                                                   self.judge_problem, self.learn.problem) if h]
+
+    def apply_learned(self):
+        """self.cfg = the config + learned groups. Never lets learning break blocking."""
+        try:
+            self.cfg = learn.merge(self.base_cfg, self.learn.store.sites)
+        except Exception as e:
+            traceback.print_exc()
+            self.cfg = self.base_cfg
+            self.learn.problem = f"learn: learned sites not applied: {type(e).__name__}: {e}"
 
     def _set_policy_problem(self, reason):
         self.policy_problem = f"judge: policy file rejected: {reason}" if reason else None
@@ -145,7 +156,7 @@ class Daemon:
     def _save(self):
         try:
             self.state.save(paths.state_file())
-        except OSError as e:
+        except (OSError, ValueError) as e:
             print(f"focusd: cannot save state: {e}", file=sys.stderr)
 
     def _day_start(self, now):
@@ -267,7 +278,8 @@ class Daemon:
             for e in errors:
                 self.log("config_error", error=e)
             if cfg is not None and not fatal:
-                self.cfg = cfg
+                self.base_cfg = cfg
+                self.apply_learned()
                 self.config_problem = None
                 self._events_group()
                 self.log("config_reload")
@@ -287,7 +299,7 @@ class Daemon:
         if cfg is None:
             print(f"focusd: no usable config: {'; '.join(errors)}", file=sys.stderr)
             return 1
-        self.cfg = cfg
+        self.cfg = self.base_cfg = cfg
         try:
             self.server = self._bind()
         except (OSError, RuntimeError) as e:
@@ -314,6 +326,7 @@ class Daemon:
         self._save()          # rewrites state.json as 0600 (it holds reasons and titles)
         self.judge_calls.extend(sorted(e["t"] for e in self.events.since(now - 3600, JUDGE_CALL_EVENTS)))
         self.lists.load_cache(cfg)
+        self._load_learned()
         self._cfg_stat = _stat(paths.config_file())
         self._policy_stat = _stat(paths.p(cfg.judge.policy_file))
         self._check_policy()
@@ -324,6 +337,14 @@ class Daemon:
         self.loop()
         self.shutdown()
         return 0
+
+    def _load_learned(self):
+        try:
+            self.learn.load()
+        except Exception as e:       # missing/garbage files mean "nothing learned"
+            traceback.print_exc()
+            self.learn.problem = f"learn: cannot load learned sites: {type(e).__name__}: {e}"
+        self.apply_learned()
 
     def _on_stop(self, signum, frame):
         self.stop_requested = True
@@ -356,6 +377,10 @@ class Daemon:
                 self.lists.refresh(self.cfg, now)
             except Exception:
                 traceback.print_exc()
+            try:
+                self.learn.tick(time.time())
+            except Exception:
+                traceback.print_exc()
 
     def shutdown(self):
         """Fail closed: drop every unlock, write the fully locked files, stop."""
@@ -375,6 +400,7 @@ class Daemon:
             with self.procs_lock:
                 for proc in list(self.judge_procs):
                     judge.signal_group(proc)
+            self.learn.flush(time.time(), force=True)
             self.log("stop")
             self.closed = True
         if self.server:
@@ -420,7 +446,7 @@ class Daemon:
             if uid not in self.allowed_uids():
                 return _err("forbidden", "not allowed to talk to focusd")
             try:
-                req = json.loads(raw)
+                req = scrub(json.loads(raw))
             except ValueError:
                 return _err("bad_request", "request is not valid JSON")
             if not isinstance(req, dict):
@@ -431,7 +457,7 @@ class Daemon:
                 return _err("unknown_op", f"unknown op {op!r}")
             return fn(req)
         except Fail as f:
-            return _err(f.code, f.message)
+            return {**_err(f.code, f.message), **f.extra}
         except Exception as e:
             traceback.print_exc()
             return _err("internal", f"internal error: {type(e).__name__}")
@@ -463,6 +489,7 @@ class Daemon:
                     "hosts_count": self._counts.get(gid, 0),
                     "url_block": list(g.url_block), "url_allow": list(g.url_allow),
                     "title_patterns": list(g.title_patterns),
+                    **({"learned": True} if g.learned else {}),
                 })
             unlocks = [{"group": gid, "label": cfg.groups[gid].label, **u}
                        for gid, u in sorted(live.items(), key=lambda kv: kv[1]["until"])
@@ -605,6 +632,12 @@ class Daemon:
                     raise
                 rule = self._unlock_rules(g, now)
                 target = {"group": sess.target}
+            elif sess.kind == "learn_remove":
+                if self.learn.site(sess.target) is None:
+                    self.sessions.pop(sid, None)
+                    raise Fail("unknown_site", "that site is no longer on the learned list")
+                rule = self._learn_remove_rules(sess.target, now)
+                target = {"domain": sess.target}
             else:
                 p = self.penalty(sess.target)
                 if p is None or p["until"] <= now:
@@ -639,6 +672,14 @@ class Daemon:
                     now=now, cfg=cfg, group=group, requested=sess.requested, used=used,
                     today_events=today, active_penalties=pens, turns=sess.turns,
                     final=final, context=ctx)
+        elif sess.kind == "learn_remove":
+            site = dict(self.learn.site(sess.target))
+            usage = self.learn.usage_of(sess.target, cfg, now)
+
+            def build(ctx):
+                return judge.learn_remove_prompt(
+                    now=now, cfg=cfg, site=site, usage=usage, today_events=today,
+                    active_penalties=pens, turns=sess.turns, final=final, context=ctx)
         else:
             penalty = dict(self.penalty(sess.target))
 
@@ -688,6 +729,8 @@ class Daemon:
             self.judge_problem = None
             if sess.kind == "unlock":
                 return self._apply_unlock(sess, verdict, final)
+            if sess.kind == "learn_remove":
+                return self._apply_learn_remove(sess, verdict, final)
             return self._apply_appeal(sess, verdict, final)
 
     def _apply_unlock(self, sess, v, final):
@@ -759,6 +802,81 @@ class Daemon:
             self.reconcile()
         return resp
 
+    # ---- learned sites
+
+    def op_learn_status(self, req):
+        with self.lock:
+            return self.learn.status(time.time())
+
+    def op_learn_run(self, req):
+        with self.lock:
+            if self.cfg.learn.mode == "off":
+                raise Fail("not_learning", "learn.mode is off")
+            if not self.learn.begin():
+                raise Fail("busy", "a review is already running")
+        try:
+            return {"ok": True, "result": self.learn.review()}
+        except learn.ReviewFailed as e:
+            raise Fail("learn_failed", f"The review failed: {str(e)[:200]}") from None
+
+    def op_learn_add(self, req):
+        raw, label = req.get("domain"), req.get("label")
+        if not isinstance(raw, str) or (label is not None and not isinstance(label, str)):
+            raise Fail("bad_request", "'domain' and 'label' must be strings")
+        with self.lock:
+            try:
+                return {"ok": True, "site": dict(self.learn.add_by_hand(raw, label, time.time()))}
+            except learn.GuardFailed as e:
+                rule = e.args[0]
+                raise Fail("not_allowed", learn.GUARD_TEXT.get(rule, rule), rule=rule) from None
+
+    def _learn_remove_rules(self, domain, now):
+        cd = self.state.cooldowns.get(f"remove:{domain}")
+        until = cd + self.cfg.limits.deny_cooldown_minutes * 60 if cd is not None else 0
+        if cd is not None and now < until:
+            return "cooldown", f"That was denied recently. Try again after {hhmm(until)}.", until
+        return self._rate_limit(now)
+
+    def op_learn_remove(self, req):
+        raw, reason = req.get("domain"), req.get("reason")
+        if not isinstance(raw, str) or not isinstance(reason, str):
+            raise Fail("bad_request", "'domain' and 'reason' must be strings")
+        domain = learn.domain_of(raw)
+        with self.lock:
+            now = time.time()
+            if domain is None or self.learn.site(domain) is None:
+                raise Fail("unknown_site", f"{raw[:80]!r} is not on the learned list")
+            sess = Session("learn_remove", domain)
+            rule = self._learn_remove_rules(domain, now)
+            if rule:
+                return self._refused(sess.id, *rule, domain=domain)
+            reason = self._text(req, "reason", 3)
+            sess.turns.append([reason, None])
+            self.sessions[sess.id] = sess
+            self.log("learn_remove_request", session=sess.id, domain=domain, reason=reason)
+            job = self._prepare_round(sess, now)
+        return self._judge_round(sess, job)
+
+    def _apply_learn_remove(self, sess, v, final):
+        now, domain = time.time(), sess.target
+        decision = "deny" if v["decision"] == "ask" and final else v["decision"]
+        self.log("learn_remove_verdict", session=sess.id, domain=domain, decision=decision,
+                 message=v["message"])
+        resp = {"ok": True, "session": sess.id, "decision": decision, "message": v["message"]}
+        if decision == "ask":
+            sess.turns[-1][1] = v["message"]
+            return resp
+        self.sessions.pop(sess.id, None)
+        if decision == "deny":
+            self.state.cooldowns[f"remove:{domain}"] = now
+            self._save()
+        else:
+            site = self.learn.site(domain)
+            if site is not None:
+                resp["site"] = dict(site)
+            self.learn.remove(domain)
+        return resp
+
     # ---- lock / log / observe / penalize
 
     def op_lock(self, req):
@@ -811,6 +929,10 @@ class Daemon:
                          description=f["description"], domain=f["domain"],
                          confidence=conf, streak=streak)
             self.prev_observe = key
+            try:
+                self.learn.record(now, verdict, f["domain"], f["class"], f["title"])
+            except Exception:        # usage statistics must never fail an observe
+                traceback.print_exc()
         return {"ok": True}
 
     def _validate_domain(self, raw, never, unlocked, now):
@@ -869,7 +991,8 @@ class Daemon:
             return resp
 
 
-OPS = {"status", "unlock", "reply", "lock", "log", "observe", "penalize", "appeal"}
+OPS = {"status", "unlock", "reply", "lock", "log", "observe", "penalize", "appeal",
+       "learn_status", "learn_run", "learn_add", "learn_remove"}
 
 
 # ---------------------------------------------------------------- socket
@@ -907,7 +1030,11 @@ class _Handler(socketserver.BaseRequestHandler):
             resp = d.dispatch(raw, uid)
         try:
             sock.settimeout(IO_TIMEOUT)
-            sock.sendall(json.dumps(resp, ensure_ascii=False).encode() + b"\n")
+            try:
+                payload = json.dumps(resp, ensure_ascii=False).encode("utf-8", "replace")
+            except (TypeError, ValueError):
+                payload = json.dumps(_err("internal", "unserialisable response")).encode()
+            sock.sendall(payload + b"\n")
         except OSError:
             pass
 

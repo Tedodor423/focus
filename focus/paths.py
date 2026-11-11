@@ -50,6 +50,14 @@ def events_file() -> str:
     return p("/var/lib/focus/events.jsonl")
 
 
+def usage_file() -> str:
+    return p("/var/lib/focus/usage.json")
+
+
+def learned_file() -> str:
+    return p("/var/lib/focus/learned.json")
+
+
 def lists_dir() -> str:
     return p("/var/lib/focus/lists")
 

@@ -13,13 +13,15 @@ import re
 import tomllib
 from dataclasses import dataclass, field
 
-GROUP_ID_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
-USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+GROUP_ID_RE = re.compile(r"^[a-z0-9_-]{1,32}\Z")
+USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}\Z")
 _LABEL = r"[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?"
 _TLD = r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?"  # starts with a letter: no IPs
-HOST_RE = re.compile(rf"^(?:{_LABEL}\.)+{_TLD}$")
+HOST_RE = re.compile(rf"^(?:{_LABEL}\.)+{_TLD}\Z")
 WATCH_MODES = ("off", "observe", "nudge", "enforce")
+LEARN_MODES = ("off", "suggest", "auto")
 DEFAULT_JUDGE_COMMAND = ["claude"]
+DEFAULT_BROWSER_CLASSES = ["^vivaldi", "^chromium$", "^firefox", "^google-chrome"]
 
 
 # ---------------------------------------------------------------- hostnames
@@ -58,18 +60,26 @@ def overlaps_any(name: str, domains) -> bool:
 # Registrable-domain suffixes that must never be blocked as a whole. Two-label
 # names like co.uk / ac.uk / com.au are caught by the rule in too_broad().
 PUBLIC_SUFFIXES = frozenset({
+    # shared hosting and platforms: a tenant may be blocked, the platform never
     "github.io", "gitlab.io", "blogspot.com", "wordpress.com", "herokuapp.com",
     "appspot.com", "netlify.app", "vercel.app", "pages.dev", "workers.dev", "web.app",
-    "firebaseapp.com", "cloudfront.net", "amazonaws.com", "s3.amazonaws.com",
-    "azurewebsites.net", "ngrok.io", "ngrok-free.app", "fly.dev", "onrender.com",
-    "readthedocs.io", "substack.com", "medium.com", "tumblr.com",
+    "firebaseapp.com", "azurewebsites.net", "ngrok.io", "ngrok-free.app", "fly.dev",
+    "onrender.com", "readthedocs.io", "substack.com", "medium.com", "tumblr.com",
+    "atlassian.net", "myshopify.com", "wixsite.com", "notion.site",
+    # shared infrastructure: half the web loads through these
+    "cloudflare.com", "cloudflare.net", "jsdelivr.net", "fastly.net", "fastly.com",
+    "akamaized.net", "akamai.net", "cloudfront.net", "amazonaws.com", "s3.amazonaws.com",
+    "azureedge.net",
 })
+# Public-sector suffixes: nothing at or under these is ever blocked by the AI or a penalty.
+PUBLIC_SECTOR_SUFFIXES = frozenset({"gov.uk", "gov.cz", "gouv.fr", "gov", "edu", "ac.uk", "europa.eu"})
 
 
 def too_broad(d: str) -> bool:
-    """A public suffix or a very short name: blocking it would hit unrelated sites."""
+    """A public suffix, shared infrastructure, public-sector site or very short
+    name: blocking it would hit unrelated sites."""
     labels = d.split(".")
-    if len(labels) < 2 or d in PUBLIC_SUFFIXES:
+    if len(labels) < 2 or d in PUBLIC_SUFFIXES or under_any(d, PUBLIC_SECTOR_SUFFIXES):
         return True
     return len(labels) == 2 and len(labels[0]) <= 3 and len(labels[1]) == 2
 
@@ -158,6 +168,7 @@ class Group:
     url_allow: list = field(default_factory=list)
     webapp_classes: list = field(default_factory=list)
     title_patterns: list = field(default_factory=list)
+    learned: bool = False            # rendered from learned.json, not the config
 
 
 @dataclass
@@ -166,6 +177,21 @@ class WatchCfg:
     title_interval_seconds: int = 60
     penalty_minutes: int = 30
     max_active_penalties: int = 10
+    browser_classes: list = field(default_factory=lambda: list(DEFAULT_BROWSER_CLASSES))
+
+
+@dataclass
+class LearnCfg:
+    mode: str = "off"                # no [learn] section: nothing is collected or reviewed
+    review_hours: int = 24
+    window_days: int = 7
+    min_minutes: int = 20
+    max_work_share: float = 0.4
+    max_new_per_review: int = 2
+    max_sites: int = 30
+    unlock_max_minutes: int = 10
+    unlock_daily_minutes: int = 20
+    never_learn: list = field(default_factory=list)
 
 
 @dataclass
@@ -181,6 +207,7 @@ class Config:
     lists: dict = field(default_factory=dict)    # name -> ListCfg, file order
     groups: dict = field(default_factory=dict)   # id -> Group, file order
     watch: WatchCfg = field(default_factory=WatchCfg)
+    learn: LearnCfg = field(default_factory=LearnCfg)
 
     def cap(self, g: Group) -> int:
         """Effective per-grant cap for a group."""
@@ -217,6 +244,13 @@ class _Reader:
             self.err(f"{where}{key}: expected an integer in [{lo}, {hi}], got {v!r}")
             return default
         return v
+
+    def float(self, t, key, default, where, lo=0.0, hi=1.0):
+        v = t.get(key, default)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not lo <= v <= hi:
+            self.err(f"{where}{key}: expected a number in [{lo}, {hi}], got {v!r}")
+            return default
+        return float(v)
 
     def bool(self, t, key, default, where):
         v = t.get(key, default)
@@ -427,5 +461,26 @@ def from_dict(data: dict):
         title_interval_seconds=r.int(wt, "title_interval_seconds", 60, w, lo=1, hi=86400),
         penalty_minutes=r.int(wt, "penalty_minutes", 30, w, lo=1, hi=1440),
         max_active_penalties=r.int(wt, "max_active_penalties", 10, w, hi=1000),
+        browser_classes=r.regexes(wt, "browser_classes", w) if "browser_classes" in wt
+        else list(DEFAULT_BROWSER_CLASSES),
+    )
+
+    lt = r.table(data, "learn", "")
+    w = "learn."
+    lmode = lt.get("mode", "off")
+    if lmode not in LEARN_MODES:
+        r.err(f"learn.mode: unknown mode {lmode!r}, using 'off'")
+        lmode = "off"
+    cfg.learn = LearnCfg(
+        mode=lmode,
+        review_hours=r.int(lt, "review_hours", 24, w, lo=1, hi=8760),
+        window_days=r.int(lt, "window_days", 7, w, lo=1, hi=60),
+        min_minutes=r.int(lt, "min_minutes", 20, w, lo=1, hi=100000),
+        max_work_share=r.float(lt, "max_work_share", 0.4, w),
+        max_new_per_review=r.int(lt, "max_new_per_review", 2, w, hi=50),
+        max_sites=r.int(lt, "max_sites", 30, w, hi=1000),
+        unlock_max_minutes=r.int(lt, "unlock_max_minutes", 10, w, lo=1, hi=1440),
+        unlock_daily_minutes=r.int(lt, "unlock_daily_minutes", 20, w, hi=1440),
+        never_learn=r.hosts(lt, "never_learn", w),
     )
     return cfg, r.errors, fatal

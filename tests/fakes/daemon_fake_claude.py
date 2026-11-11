@@ -5,6 +5,7 @@ a JSON file {"responses": [step, ...]}; call N uses step N (the last step
 repeats). A step is one of:
   {"decision": "grant", "minutes": 15, "message": "ok"}  normal verdict
   {"raw": "<stdout text>"}                              print this verbatim
+  {"structured": {...}}                                 any structured_output (review)
   {"is_error": true}                                    is_error output
   {"exit": 3, "stdout": "..."}                         print stdout (optional), exit 3
   {"sleep": 5, ...}                                     sleep first (spawns a
@@ -45,6 +46,10 @@ def main():
         with open(script + ".child", "w") as f:
             f.write(str(child.pid))
         time.sleep(step["sleep"])
+    if "structured" in step:
+        print(json.dumps({"type": "result", "is_error": False, "result": "",
+                          "structured_output": step["structured"]}))
+        return
     if "exit" in step:
         sys.stdout.write(step.get("stdout", ""))
         print("fake failure", file=sys.stderr)

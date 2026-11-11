@@ -27,7 +27,12 @@ MAX_REQUEST = 64 * 1024          # the daemon rejects bigger requests
 MAX_RESPONSE = 32 * 1024 * 1024  # sanity cap for log replies
 REASON_MIN, REASON_MAX = 3, 2000
 MAX_ROUNDS = 20                  # guard against a daemon that never stops asking
+LEARNED_IN_PICKER = 5            # the unlock picker lists at most this many learned sites
 PENALTY_ID_RE = re.compile(r"^p[0-9a-f]{8}$")
+# Same rule as the daemon's config.valid_hostname (cli.py can't import it).
+_LABEL = r"[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?"
+_TLD = r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?"
+DOMAIN_RE = re.compile(rf"^(?:{_LABEL}\.)+{_TLD}$")
 UNREACHABLE_JSON = '{"ok":false,"error":"daemon_unreachable"}'
 
 # Every event type in §8 except "observe"; `focus log` shows these by default
@@ -37,6 +42,7 @@ LOG_TYPES = [
     "request", "followup", "verdict", "unlock", "refused", "expire", "lock",
     "restore", "hosts_error", "list_update", "list_error", "judge_error",
     "penalty", "penalty_end", "appeal", "appeal_verdict",
+    "learn_review", "learn_add", "learn_remove", "learn_remove_request", "learn_error",
 ]
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_UNREACHABLE, EXIT_INTERRUPT = 0, 1, 2, 3, 130
@@ -53,9 +59,15 @@ usage: focus [command] [options]
   focus groups                          all groups and their budgets
   focus appeal [penalty-id] [reason…]   appeal a monitor penalty
   focus watch [-n N] [--json]           screen monitor state and recent checks
+  focus learned [--json]                sites blocked by adaptive blocking
+  focus learned add <domain> [label…] [--json]
+                                        block one more site (no judge needed)
+  focus learned remove <domain> [reason…]
+                                        ask the judge to remove a learned site
+  focus learn [--json]                  run a review of watched sites now
 
-unlock and appeal also take --pause (wait for Enter before exiting, for
-floating terminals).
+unlock, appeal and learned remove also take --pause (wait for Enter before
+exiting, for floating terminals).
 """
 
 
@@ -160,6 +172,8 @@ ERROR_TEXT = {
     "unknown_session": "This conversation with the judge expired. Start again.",
     "unknown_penalty": "That penalty isn't active any more.",
     "not_enforcing": "The monitor isn't in enforce mode.",
+    "not_learning": "Adaptive blocking is off in the config.",
+    "busy": "A review is already running. Try again when it has finished.",
     "unknown_op": "focusd doesn't know this request (version mismatch?).",
 }
 
@@ -393,6 +407,10 @@ def find_group(groups, name):
     for g in groups:
         if (g.get("id") or "").lower() == low or group_label(g).lower() == low:
             return g
+    host = low[4:] if low.startswith("www.") else low
+    for g in groups:
+        if g.get("learned") and host in [h.lower() for h in g.get("url_block") or []]:
+            return g
     return None
 
 
@@ -424,7 +442,10 @@ def unlock_problem(g, status, now):
 
 
 def unknown_group_text(name, groups):
-    ids = ", ".join(g.get("id") or "?" for g in groups)
+    ids = ", ".join(g.get("id") or "?" for g in groups if not g.get("learned"))
+    learned = sum(1 for g in groups if g.get("learned"))
+    if learned:
+        ids = (ids + " " if ids else "") + "+%d learned" % learned
     return "No group called '%s'.%s" % (name, (" Groups: %s." % ids) if ids else "")
 
 
@@ -553,8 +574,12 @@ def cmd_status(args):
                                                   clock(_num(u.get("until")), now)),
                      None))
 
-    locked = [group_label(g) for g in groups if g.get("enabled", True) and g.get("locked")]
-    rows.append(("Locked", ", ".join(locked) if locked else "nothing", None))
+    locked = [g for g in groups if g.get("enabled", True) and g.get("locked")]
+    text = ", ".join(group_label(g) for g in locked if not g.get("learned"))
+    learned = sum(1 for g in locked if g.get("learned"))
+    if learned:
+        text = (text + " " if text else "") + "+%d learned" % learned
+    rows.append(("Locked", text or "nothing", None))
 
     off = [group_label(g) for g in groups if not g.get("enabled", True)]
     if off:
@@ -562,7 +587,11 @@ def cmd_status(args):
 
     used = ["%s %s/%s min" % (group_label(g), fmt_min(g.get("used_today_min")),
                               fmt_min(g.get("daily_minutes")))
-            for g in groups if _num(g.get("used_today_min")) > 0]
+            for g in groups if _num(g.get("used_today_min")) > 0 and not g.get("learned")]
+    used_learned = [_num(g.get("used_today_min")) for g in groups
+                    if g.get("learned") and _num(g.get("used_today_min")) > 0]
+    if used_learned:
+        used.append("+%d learned (%s min)" % (len(used_learned), fmt_min(sum(used_learned))))
     rows.append(("Today", " · ".join(used) if used else "no unlocks yet", None))
 
     pens = sorted((p for p in st.get("penalties") or [] if _num(p.get("until")) > now),
@@ -599,6 +628,14 @@ def monitor_silent(w, now):
     return last is None or now - _num(last) > 3 * interval
 
 
+def fit_info(info, room):
+    """Shorten a ' · '-separated note to fit, dropping it if nothing fits."""
+    if len(info) <= room:
+        return info
+    head = info.split(" · ")[0]
+    return head if len(head) <= room else ""
+
+
 def pick_group(groups, status, now):
     """Numbered list of unlockable groups (§9). Already-unlocked ones are
     offered too: the daemon extends them (§6)."""
@@ -618,26 +655,41 @@ def pick_group(groups, status, now):
         left = _num(g.get("unlocked_until")) - now
         return "%s (unlocked, %s left — extend)" % (group_label(g), minutes_text(left))
 
+    # A long list of learned sites must not push the rest off a small terminal:
+    # show a few (unlocked ones first, so they can be extended); the others can
+    # be typed by name or domain.
+    plain = [g for g, _ in ready if not g.get("learned")]
+    learned = sorted((g for g, _ in ready if g.get("learned")),
+                     key=lambda g: bool(g.get("locked", True)))
+    numbered = plain + learned[:LEARNED_IN_PICKER]
+    hidden = len(learned) - len(learned[:LEARNED_IN_PICKER])
+
     out(c("Unlock which group?", "bold"))
-    name_w = max(len(name(g)) for g in candidates)
-    for i, (g, _) in enumerate(ready, 1):
+    listed = numbered + [g for g, _ in blocked]
+    name_w = min(max(len(name(g)) for g in listed), 24)
+    for i, g in enumerate(numbered, 1):
         left = budget_left(g)
         info = "%s min left today" % fmt_min(left) if left is not None else ""
         if g.get("max_minutes"):
             info += ("%sup to %s per unlock" % (" · " if info else "", fmt_min(g["max_minutes"])))
-        out("  %d) %s  %s" % (i, name(g).ljust(name_w), c(info, "dim")))
+        label = name(g).ljust(name_w)
+        info = fit_info(info, width() - len("  %d) %s  " % (i, label)))
+        out(("  %d) %s  %s" % (i, label, c(info, "dim"))).rstrip())
     for g, problem in blocked:
         cd = g.get("cooldown_until")
         why = ("cooldown until %s" % clock(_num(cd), now)) if cd and _num(cd) > now \
             else "no time left today"
         out(c("     %s  %s" % (name(g).ljust(name_w), why), "dim"))
+    if hidden > 0:
+        out(c("     +%d more learned site%s: type a name or domain"
+              % (hidden, "" if hidden == 1 else "s"), "dim"))
 
     while True:
         choice = read_line(c("> ", "cyan")).strip()
         if not choice:
             continue
-        if choice.isdigit() and 1 <= int(choice) <= len(ready):
-            return ready[int(choice) - 1][0]
+        if choice.isdigit() and 1 <= int(choice) <= len(numbered):
+            return numbered[int(choice) - 1]
         g = find_group(groups, choice)
         if g is not None:
             for rg, _ in ready:
@@ -793,8 +845,8 @@ def cmd_groups(args):
     if not groups:
         out("No groups configured.")
         return EXIT_OK
-    lw = max(len(group_label(g)) for g in groups)
-    iw = max(len(g.get("id") or "") for g in groups)
+    lw = min(max(len(group_label(g)) for g in groups), 20)
+    iw = min(max(len(g.get("id") or "") for g in groups), 20)
     for g in groups:
         bits = []
         if not g.get("enabled", True):
@@ -875,7 +927,8 @@ def describe_event(e, labels, now):
         return "%s unlocked for %s min%s" % (lab(e.get("group")), fmt_min(e.get("minutes")),
                                              ", until %s" % clock(_num(until), now) if until else ""), "green"
     if t == "refused":
-        return "%s refused (%s)" % (lab(e.get("group")), e.get("rule")), "yellow"
+        what = e.get("group") and lab(e.get("group")) or e.get("domain") or e.get("penalty")
+        return "%s refused (%s)" % (what or "?", e.get("rule")), "yellow"
     if t == "expire":
         return "%s locked again (time up)" % lab(e.get("group")), None
     if t == "lock":
@@ -912,6 +965,24 @@ def describe_event(e, labels, now):
         return "appeal %s: %s%s" % (e.get("penalty"), d,
                                     " — %s" % q(e.get("message")) if e.get("message") else ""), \
             "green" if d == "grant" else ("yellow" if d == "deny" else None)
+    if t == "learn_review":
+        parts = result_parts(e)
+        cand = e.get("candidates")
+        n = count_of(cand)
+        return "site review: %d candidate%s%s" % (n, "" if n == 1 else "s",
+                                                   ", " + ", ".join(parts) if parts else ""), None
+    if t == "learn_add":
+        d, label = e.get("domain") or "?", e.get("label")
+        name = "%s (%s)" % (label, d) if label and label != d else d
+        by = {"ai": "by the AI", "user": "by you"}.get(e.get("by"), e.get("by"))
+        reason = ": " + q(e.get("reason")) if e.get("reason") else ""
+        return "now blocking %s%s%s" % (name, " " + by if by else "", reason), "yellow"
+    if t == "learn_remove":
+        return "%s no longer blocked (removed by the judge)" % e.get("domain"), "green"
+    if t == "learn_remove_request":
+        return "asked to unblock %s: %s" % (e.get("domain"), q(e.get("reason"))), None
+    if t == "learn_error":
+        return "site review failed: %s" % one_line(e.get("error")), "red"
     rest = {k: v for k, v in e.items() if k not in ("t", "type")}
     return "%s %s" % (t, one_line(json.dumps(rest, ensure_ascii=False), 90) if rest else ""), None
 
@@ -1031,6 +1102,248 @@ def cmd_watch(args):
 
 
 # --------------------------------------------------------------------------
+# adaptive blocking (§13)
+
+
+def parse_domain(text):
+    """Accepts a bare domain or a pasted URL; returns the normalised domain."""
+    d = text.strip().lower()
+    d = re.sub(r"^[a-z][a-z0-9+.-]*://", "", d)
+    d = re.split(r"[/?#]", d, maxsplit=1)[0].rstrip(".")
+    if d.startswith("www."):
+        d = d[4:]
+    if (len(d) > 253 or not DOMAIN_RE.match(d)
+            or d.startswith("localhost.") or d.endswith(".localhost")):
+        raise CliExit(EXIT_USAGE, "focus: '%s' doesn't look like a domain "
+                      "(for example news.ycombinator.com)." % text)
+    return d
+
+
+def learn_failure(resp):
+    """CliExit for an error reply; not_learning and busy are ordinary states."""
+    if resp.get("error") in ("not_learning", "busy"):
+        return CliExit(EXIT_FAIL, error_text(resp), to_stderr=False)
+    return CliExit(EXIT_FAIL, "focus: " + error_text(resp))
+
+
+def short_date(t):
+    dt = datetime.datetime.fromtimestamp(t)
+    return "%d %s" % (dt.day, dt.strftime("%b"))
+
+
+def count_of(x):
+    if isinstance(x, (list, tuple, dict)):
+        return len(x)
+    return int(_num(x))
+
+
+def result_parts(result):
+    """'1 added, 2 kept', in a fixed order, leaving out zeros."""
+    parts = []
+    for key, text in (("added", "added"), ("suggested", "suggested"), ("kept", "kept"),
+                      ("need_more_data", "need more data"), ("skipped", "skipped")):
+        n = count_of(result.get(key))
+        if n:
+            parts.append("%d %s" % (n, text))
+    return parts
+
+
+def site_entry(item):
+    """(domain or key, label, reason) from a site, decision or bare string."""
+    if not isinstance(item, dict):
+        return str(item), "", ""
+    name = item.get("domain") or item.get("candidate") or item.get("key") or "?"
+    label = item.get("label") or ""
+    return name, "" if label == name else label, item.get("reason") or ""
+
+
+def site_note(label, reason, by=None, room=60):
+    note = reason or ("added by you" if by == "user" else "")
+    text = " — ".join(x for x in (label, one_line(note, 200)) if x)
+    return one_line(text, max(20, room))
+
+
+def learned_view(resp):
+    now = _now()
+    rows = [("Mode", str(resp.get("mode") or "?"), None)]
+
+    sites = [s for s in resp.get("sites") or [] if isinstance(s, dict)]
+    sites.sort(key=lambda s: _num(s.get("added")), reverse=True)
+    dw = min(max([len(s.get("domain") or "?") for s in sites] or [0]), 26)
+    for i, s in enumerate(sites):
+        name, label, reason = site_entry(s)
+        when = short_date(_num(s.get("added"))) if s.get("added") else ""
+        room = width() - 10 - dw - 2 - len(when) - 2
+        note = site_note(label, reason, s.get("by"), room)
+        rows.append(("Blocked" if i == 0 else "",
+                     ("%s  %s  %s" % (name.ljust(dw), when, note)).rstrip(), None))
+    if not sites:
+        rows.append(("Blocked", "none yet", None))
+
+    suggestions = resp.get("suggestions") or []
+    entries = [site_entry(x) for x in suggestions]
+    sw = min(max([len(e[0]) for e in entries] or [0]), 26)
+    for i, (name, label, reason) in enumerate(entries):
+        note = site_note(label, reason, room=width() - 10 - sw - 2)
+        rows.append(("Suggested" if i == 0 else "", ("%s  %s" % (name.ljust(sw), note)).rstrip(),
+                     None))
+
+    cands = [x for x in resp.get("candidates") or [] if isinstance(x, dict)]
+    kw = min(max([len(one_line(x.get("key"), 40)) for x in cands] or [0]), 26)
+    for i, x in enumerate(cands):
+        counts = x.get("counts") if isinstance(x.get("counts"), dict) else {}
+        detail = ", ".join("%s %s" % (fmt_min(v), k) for k, v in counts.items()
+                           if k != "ticks" and _num(v))
+        rows.append(("Watching" if i == 0 else "",
+                     ("%s  %s min  %s" % (one_line(x.get("key"), 40).ljust(kw),
+                                          fmt_min(x.get("minutes")), c(detail, "dim"))).rstrip(),
+                     None))
+
+    last = resp.get("last_review")
+    result = resp.get("last_result")
+    if not last:
+        rows.append(("Last", "no review yet", None))
+    else:
+        text = "%s (%s)" % (clock(_num(last), now), ago(now - _num(last)))
+        style = None
+        if isinstance(result, dict) and result.get("error"):
+            text += " · failed: %s" % one_line(result.get("error"), 80)
+            style = "red"
+        elif isinstance(result, dict):
+            text += " · " + (", ".join(result_parts(result)) or "nothing to decide")
+        rows.append(("Last", text, style))
+    print_rows(rows)
+    return EXIT_OK
+
+
+def learned_add(args, words):
+    if not words:
+        raise CliExit(EXIT_USAGE, "focus: usage: focus learned add <domain> [label…]")
+    domain = parse_domain(words[0])
+    label = " ".join(words[1:]).strip()
+    req = {"op": "learn_add", "domain": domain}
+    if label:
+        req["label"] = label
+    resp, raw = request_raw(req)
+    if args.json:
+        out(raw)
+        return EXIT_OK if resp.get("ok") else EXIT_FAIL
+    if not resp.get("ok"):
+        raise learn_failure(resp)
+    site = resp.get("site") if isinstance(resp.get("site"), dict) else {}
+    name = site.get("label") or label or domain
+    out(c("Now blocking %s." % (domain if name == domain else "%s (%s)" % (name, domain)), "bold"))
+    out(c("Removing it later takes the judge: focus learned remove %s" % domain, "dim"))
+    return EXIT_OK
+
+
+def learned_remove(args, words):
+    if not words:
+        raise CliExit(EXIT_USAGE, "focus: usage: focus learned remove <domain> [reason…]")
+    domain = parse_domain(words[0])
+    reason = " ".join(words[1:]).strip() or None
+    if reason is None:
+        require_tty("no reason given")
+    elif not REASON_MIN <= len(reason) <= REASON_MAX:
+        raise CliExit(EXIT_USAGE, "focus: the reason must be %d–%d characters."
+                      % (REASON_MIN, REASON_MAX))
+
+    st = request({"op": "learn_status"})
+    if not st.get("ok"):
+        raise learn_failure(st)
+
+    def norm(s):
+        d = (s.get("domain") or "").lower()
+        return d[4:] if d.startswith("www.") else d
+
+    site = next((s for s in st.get("sites") or [] if isinstance(s, dict) and norm(s) == domain),
+                None)
+    if site is None:
+        raise CliExit(EXIT_FAIL, "%s isn't a learned site." % domain, to_stderr=False)
+    domain = site.get("domain") or domain
+    label = site.get("label") or domain
+    name = domain if label == domain else "%s (%s)" % (label, domain)
+
+    when = " – blocked %s" % short_date(_num(site.get("added"))) if site.get("added") else ""
+    out(c(name + when, "bold"))
+    note = one_line(site.get("reason"), width() - 2)
+    if note:
+        out(c("  " + note, "dim"))
+
+    if reason is None:
+        reason = ask_text("Why was blocking this a mistake?")
+
+    def on_grant(resp):
+        out(c("%s is no longer blocked. It won't be learned again." % name, "green", "bold"))
+
+    def on_deny(resp):
+        out(c("Denied. %s stays blocked." % name, "yellow"))
+
+    req = {"op": "learn_remove", "domain": domain, "reason": reason}
+    return judge_loop(req, "Removing " + domain, on_grant, on_deny,
+                      "focus learned remove %s" % domain)
+
+
+def cmd_learned(args):
+    words = list(args.words)
+    action = words.pop(0) if words else None
+    if action not in (None, "add", "remove"):
+        raise CliExit(EXIT_USAGE, "focus: unknown action '%s' (use add or remove)." % action)
+    if args.pause and action != "remove":
+        raise CliExit(EXIT_USAGE, "focus: --pause only applies to `focus learned remove`.")
+    if action == "add":
+        return learned_add(args, words)
+    if action == "remove":
+        if args.json:
+            raise CliExit(EXIT_USAGE, "focus: `focus learned remove` is interactive; "
+                          "it has no --json.")
+        return learned_remove(args, words)
+    resp, raw = request_raw({"op": "learn_status"})
+    if args.json:
+        out(raw)
+        return EXIT_OK if resp.get("ok") else EXIT_FAIL
+    if not resp.get("ok"):
+        raise learn_failure(resp)
+    return learned_view(resp)
+
+
+def cmd_learn(args):
+    req = {"op": "learn_run"}
+    if args.json:
+        resp, raw = request_raw(req)
+        out(raw)
+        return EXIT_OK if resp.get("ok") else EXIT_FAIL
+    try:
+        with Waiting("Reviewing sites…"):
+            resp = request(req)
+    except KeyboardInterrupt:
+        err("Cancelled. The review keeps running; see `focus learned` later.")
+        raise
+    if not resp.get("ok"):
+        raise learn_failure(resp)
+    result = resp.get("result") if isinstance(resp.get("result"), dict) else {}
+    rows = []
+    for key, head, style in (("added", "Blocked", "yellow"), ("suggested", "Suggested", None),
+                             ("kept", "Kept open", None), ("need_more_data", "Need data", "dim")):
+        for i, item in enumerate(result.get(key) or []):
+            name, label, reason = site_entry(item)
+            note = site_note(label, reason, room=width() - 10 - len(name) - 2)
+            rows.append((head if i == 0 else "", ("%s  %s" % (name, note)).rstrip(), style))
+    for i, item in enumerate(result.get("skipped") or []):
+        if isinstance(item, dict):
+            text = "%s (%s)" % (item.get("candidate") or "?",
+                                str(item.get("rule") or "?").replace("_", " "))
+        else:
+            text = str(item)
+        rows.append(("Skipped" if i == 0 else "", one_line(text, width() - 10), "dim"))
+    if not rows:
+        out("Nothing to review yet.")
+        return EXIT_OK
+    print_rows(rows)
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------
 # argument parsing
 
 
@@ -1072,6 +1385,13 @@ def build_parser(cmd):
     elif cmd == "watch":
         p.add_argument("-n", type=_log_limit, default=10, help="recent checks (default 10)")
         p.add_argument("--json", action="store_true", help="print JSON")
+    elif cmd == "learned":
+        p.add_argument("--json", action="store_true", help="print the daemon's JSON")
+        p.add_argument("--pause", action="store_true",
+                       help="with remove: wait for Enter before exiting")
+        p.add_argument("words", nargs="*", metavar="[add|remove] <domain> […]")
+    elif cmd == "learn":
+        p.add_argument("--json", action="store_true", help="print the daemon's JSON")
     return p
 
 
@@ -1083,6 +1403,8 @@ COMMANDS = {
     "groups": cmd_groups,
     "appeal": cmd_appeal,
     "watch": cmd_watch,
+    "learned": cmd_learned,
+    "learn": cmd_learn,
 }
 
 

@@ -76,6 +76,13 @@ class ConfigChecks:
                 self.assertIn(name, self.c["lists"])
             self.rx(g["webapp_classes"] + g["title_patterns"])  # compile
 
+    def test_linkedin_short_unlocks(self):
+        g = self.groups["linkedin"]
+        self.assertTrue(g["enabled"] and g["unlockable"])
+        self.assertEqual(g["max_minutes"], 5)
+        self.assertIn("linkedin.com", g["url_block"])
+        self.assertIn("www.linkedin.com", g["hosts"])
+
     def test_policy_only_groups(self):
         self.assertEqual(self.groups["youtube"]["hosts"], [])
         self.assertEqual(self.groups["instagram"]["hosts"], [])
@@ -129,6 +136,16 @@ class ConfigChecks:
         ("(4) Reddit - Dive into anything", "reddit"),
         ("best laptop for students - Reddit - Vivaldi", "reddit"),
         ("reddit seurat integration - Google Search - Vivaldi", None),
+        ('Feed | LinkedIn - Vivaldi', 'linkedin'),
+        ('(3) Feed | LinkedIn - Vivaldi', 'linkedin'),
+        ('Tok informací | LinkedIn - Vivaldi', 'linkedin'),
+        ('Zveřejnit | LinkedIn', 'linkedin'),
+        ('Jane Doe | LinkedIn - Vivaldi', 'linkedin'),
+        ('LinkedIn - Vivaldi', 'linkedin'),
+        ('LinkedIn: Log In or Sign Up - Vivaldi', 'linkedin'),
+        ('LinkedIn - Wikipedia - Vivaldi', None),
+        ('linkedin post tips - Google Search - Vivaldi', None),
+        ('linkedin/school-of-sre · GitHub - Vivaldi', None),
         ("Reddit - Wikipedia - Vivaldi", None),
         # X
         ("Home / X - Vivaldi", "x"),

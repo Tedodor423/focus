@@ -817,6 +817,462 @@ class TestWatch(CliTestCase):
         self.assertEqual(len(data["events"]), 2)
 
 
+def learned_group(domain, label=None, **kw):
+    gid = "l-" + domain.replace(".", "-")
+    return group(gid, label or domain, learned=True, url_block=[domain], hosts_count=2,
+                 daily_minutes=15, max_minutes=10, **kw)
+
+
+def status_with_learned(n, **kw):
+    st = make_status(**kw)
+    st["groups"] += [learned_group("site%d.example.com" % i,
+                                   "A rather long learned label number %d" % i)
+                     for i in range(n)]
+    return st
+
+
+LEARN_STATUS = {
+    "ok": True, "mode": "auto",
+    "sites": [
+        {"domain": "news.ycombinator.com", "label": "Hacker News",
+         "group": "l-news-ycombinator-com", "added": NOW - 2 * 86400,
+         "reason": "94 min over 5 days, no work seen", "minutes": 94, "by": "ai"},
+        {"domain": "example.com", "label": "example.com", "group": "l-example-com",
+         "added": NOW - 3600, "reason": "", "minutes": 0, "by": "user"},
+    ],
+    "suggestions": [{"candidate": "twitch.tv", "decision": "block", "domain": "twitch.tv",
+                     "label": "Twitch", "reason": "evening streams"}],
+    "rejected": ["arxiv-sanity.com"],
+    "last_review": NOW - 7200,
+    "last_result": {"added": ["news.ycombinator.com"], "kept": [{"candidate": "docs.python.org"}],
+                    "need_more_data": [], "skipped": [{"candidate": "foo", "rule": "no_dns"}],
+                    "suggested": []},
+    "candidates": [
+        {"key": "lobste.rs", "minutes": 34, "domain": "lobste.rs",
+         "counts": {"procrastinating": 5, "working": 1, "unclear": 0}},
+    ],
+}
+LEARN_EMPTY = {"ok": True, "mode": "off", "sites": [], "suggestions": [], "rejected": [],
+               "last_review": None, "last_result": None, "candidates": []}
+LEARN_RESULT = {"ok": True, "result": {
+    "added": [{"candidate": "lobste.rs", "decision": "block", "domain": "lobste.rs",
+               "label": "Lobsters", "reason": "34 min, almost no work"}],
+    "kept": [{"candidate": "docs.python.org", "decision": "keep_open", "domain": "",
+              "label": "", "reason": "reference docs"}],
+    "need_more_data": [{"candidate": "some forum", "decision": "need_more_data", "domain": "",
+                        "label": "", "reason": "only 12 min"}],
+    "skipped": [{"candidate": "foo.example", "rule": "not_in_dns_log"}],
+    "suggested": [],
+}}
+
+
+class TestLearned(CliTestCase):
+    def setUp(self):
+        super().setUp()
+        self.daemon.routes["learn_status"] = LEARN_STATUS
+
+    def test_view(self):
+        code, out, err = self.run_cli("learned")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.daemon.ops(), ["learn_status"])
+        lines = out.splitlines()
+        self.assertEqual(lines[0], "Mode      auto")
+        self.assertEqual(lines[1], "Blocked   example.com           5 Nov  added by you")
+        self.assertEqual(lines[2], "          news.ycombinator.com  3 Nov  "
+                                   "Hacker News — 94 min over 5 days, no wor…")
+        self.assertIn("Suggested twitch.tv  Twitch — evening streams", lines)
+        self.assertIn("Watching  lobste.rs  34 min  5 procrastinating, 1 working", lines)
+        self.assertIn("Last      15:33 (2 h ago) · 1 added, 1 kept, 1 skipped", lines)
+
+    def test_view_fits_terminal(self):
+        st = copy.deepcopy(LEARN_STATUS)
+        st["sites"][0]["reason"] = "word " * 200
+        self.daemon.routes["learn_status"] = st
+        _, out, _ = self.run_cli("learned")
+        self.assertLessEqual(max(len(x) for x in out.splitlines()), 80)
+
+    def test_view_empty(self):
+        self.daemon.routes["learn_status"] = LEARN_EMPTY
+        code, out, _ = self.run_cli("learned")
+        self.assertEqual(code, 0)
+        self.assertEqual(out.splitlines(), ["Mode      off", "Blocked   none yet",
+                                            "Last      no review yet"])
+
+    def test_view_failed_review(self):
+        self.daemon.routes["learn_status"] = dict(LEARN_STATUS, last_result={"error": "timeout"})
+        self.assertIn("failed: timeout", self.run_cli("learned")[1])
+
+    def test_json_verbatim(self):
+        raw = '{"ok":true,  "mode":"auto","sites":[]}'
+        self.daemon.routes["learn_status"] = (raw + "\n").encode()
+        code, out, _ = self.run_cli("learned", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(out, raw + "\n")
+
+    def test_not_learning(self):
+        error = {"ok": False, "error": "not_learning", "message": "learn.mode is off"}
+        self.daemon.routes["learn_status"] = error
+        code, out, err = self.run_cli("learned")
+        self.assertEqual((code, err), (1, ""))
+        self.assertIn("Adaptive blocking is off", out)
+        code, out, _ = self.run_cli("learned", "--json")
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out)["error"], "not_learning")
+
+    def test_add(self):
+        self.daemon.routes["learn_add"] = {"ok": True, "site": {"domain": "lobste.rs",
+                                                                "label": "Lobsters"}}
+        code, out, _ = self.run_cli("learned", "add", "lobste.rs", "Lobsters")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.daemon.last("learn_add"),
+                         {"op": "learn_add", "domain": "lobste.rs", "label": "Lobsters"})
+        self.assertIn("Now blocking Lobsters (lobste.rs).", out)
+        self.assertIn("focus learned remove lobste.rs", out)
+
+    def test_add_normalises_and_omits_label(self):
+        self.daemon.routes["learn_add"] = {"ok": True}
+        code, out, _ = self.run_cli("learned", "add", "https://www.Lobste.rs/t/python?x=1")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.daemon.last("learn_add"), {"op": "learn_add", "domain": "lobste.rs"})
+        self.assertIn("Now blocking lobste.rs.", out)
+
+    def test_underscore_domain_can_be_added_and_removed(self):
+        domain = "foo_bar.example.com"
+        self.daemon.routes["learn_add"] = {"ok": True}
+        self.assertEqual(self.run_cli("learned", "add", domain)[0], 0)
+        self.assertEqual(self.daemon.last("learn_add")["domain"], domain)
+        self.daemon.routes["learn_status"] = dict(LEARN_STATUS, sites=[
+            {"domain": domain, "label": domain, "group": "l-foo_bar-example-com",
+             "added": NOW - 60, "reason": "", "minutes": 0, "by": "user"}])
+        self.daemon.routes["learn_remove"] = GRANT
+        code, _, err = self.run_cli("learned", "remove", domain, "it was work")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.daemon.last("learn_remove")["domain"], domain)
+
+    def test_domain_rule_matches_daemon(self):
+        from focus import config
+        samples = ["example.com", "foo_bar.example.com", "_dmarc.example.com", "a.b.c.de",
+                   "xn--bcher-kva.example", "-bad.example.com", "bad-.example.com",
+                   "1.2.3.4", "example.c0m", "example.123", "foo.localhost", "localhost.example",
+                   "nodot", "a b.com", "a..com", ".example.com", "foo.exa_mple",
+                   "a" * 64 + ".com", ".".join(["abcdefgh"] * 29) + ".com"]
+        for name in samples:
+            try:
+                cli.parse_domain(name)
+                accepted = True
+            except cli.CliExit:
+                accepted = False
+            self.assertEqual(accepted, config.valid_hostname(name), name)
+
+    def test_add_multiword_label(self):
+        self.daemon.routes["learn_add"] = {"ok": True}
+        self.run_cli("learned", "add", "lobste.rs", "The", "Lobsters")
+        self.assertEqual(self.daemon.last("learn_add")["label"], "The Lobsters")
+
+    def test_add_json(self):
+        raw = '{"ok":true,"site":{"domain":"lobste.rs"}}'
+        self.daemon.routes["learn_add"] = (raw + "\n").encode()
+        code, out, _ = self.run_cli("learned", "add", "lobste.rs", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(out, raw + "\n")
+
+    def test_add_refused_by_guard(self):
+        self.daemon.routes["learn_add"] = {"ok": False, "error": "bad_request",
+                                           "message": "github.com is on never_block"}
+        code, out, err = self.run_cli("learned", "add", "github.com")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("github.com is on never_block", err)
+
+    def test_usage_errors(self):
+        for argv in (["learned", "frob"], ["learned", "add"], ["learned", "remove"],
+                     ["learned", "add", "notadomain"], ["learned", "add", "a b.com"],
+                     ["learned", "remove", "example.com", "x"],
+                     ["learned", "add", "example.com", "--pause"], ["learned", "--pause"],
+                     ["learned", "remove", "example.com", "it was work", "--json"]):
+            self.assertEqual(self.run_cli(*argv)[0], 2, argv)
+        self.assertEqual(self.daemon.requests, [])
+
+    def test_remove_prompt_ask_and_grant(self):
+        self.daemon.routes["learn_remove"] = ASK
+        self.daemon.routes["reply"] = dict(GRANT, granted_minutes=None, until=None,
+                                           message="Fair enough.")
+        code, out, err = self.run_cli("learned", "remove", "news.ycombinator.com",
+                                      stdin="I read it for my thesis\nchapter 3\n", tty_in=True)
+        self.assertEqual(code, 0, err)
+        self.assertIn("Hacker News (news.ycombinator.com) – blocked 3 Nov", out)
+        self.assertIn("  94 min over 5 days, no work seen", out)
+        self.assertIn("Why was blocking this a mistake?", out)
+        self.assertEqual(out.count("Asking the judge…"), 2)
+        self.assertEqual(self.daemon.last("learn_remove"),
+                         {"op": "learn_remove", "domain": "news.ycombinator.com",
+                          "reason": "I read it for my thesis"})
+        self.assertEqual(self.daemon.last("reply"),
+                         {"op": "reply", "session": "ab12cd34ef56ab78", "answer": "chapter 3"})
+        self.assertIn("Hacker News (news.ycombinator.com) is no longer blocked. "
+                      "It won't be learned again.", out)
+
+    def test_remove_with_reason_and_url(self):
+        self.daemon.routes["learn_remove"] = DENY
+        code, out, _ = self.run_cli("learned", "remove", "https://www.example.com/x",
+                                    "it", "was", "work")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.daemon.last("learn_remove"),
+                         {"op": "learn_remove", "domain": "example.com", "reason": "it was work"})
+        self.assertIn("Judge: Watch it tonight.", out)
+        self.assertIn("Denied. example.com stays blocked.", out)
+
+    def test_remove_unknown_site(self):
+        code, out, _ = self.run_cli("learned", "remove", "twitch.tv", "it was work")
+        self.assertEqual(code, 1)
+        self.assertEqual(out.strip(), "twitch.tv isn't a learned site.")
+        self.assertNotIn("learn_remove", self.daemon.ops())
+
+    def test_remove_no_reason_without_tty(self):
+        code, _, err = self.run_cli("learned", "remove", "example.com")
+        self.assertEqual(code, 2)
+        self.assertIn("not a terminal", err)
+        self.assertEqual(self.daemon.requests, [])
+
+    def test_remove_question_without_tty(self):
+        self.daemon.routes["learn_remove"] = ASK
+        code, out, err = self.run_cli("learned", "remove", "example.com", "it was work")
+        self.assertEqual(code, 2)
+        self.assertIn("focus learned remove example.com", err)
+        self.assertNotIn("reply", self.daemon.ops())
+
+    def test_remove_refused_cooldown(self):
+        self.daemon.routes["learn_remove"] = {"ok": True, "decision": "refused", "message": "",
+                                              "rule": "cooldown", "retry_after": NOW + 120}
+        code, out, _ = self.run_cli("learned", "remove", "example.com", "it was work")
+        self.assertEqual(code, 1)
+        self.assertIn("Removing example.com was denied recently. You can ask again at 17:35.", out)
+
+    def test_remove_judge_error(self):
+        self.daemon.routes["learn_remove"] = {"ok": True, "decision": "error",
+                                              "message": "judge timed out"}
+        code, out, _ = self.run_cli("learned", "remove", "example.com", "it was work")
+        self.assertEqual(code, 1)
+        self.assertIn("No decision from the judge.", out)
+
+    def test_remove_busy(self):
+        self.daemon.routes["learn_remove"] = {"ok": False, "error": "busy", "message": ""}
+        code, _, err = self.run_cli("learned", "remove", "example.com", "it was work")
+        self.assertEqual(code, 1)
+        self.assertIn("already running", err)
+
+    def test_remove_pause(self):
+        self.daemon.routes["learn_remove"] = GRANT
+        stdin = FakeIn("\n", tty=True)
+        code, out, _ = self.run_cli("learned", "remove", "--pause", "example.com", "it was work",
+                                    stdin_obj=stdin)
+        self.assertEqual(code, 0)
+        self.assertTrue(out.rstrip().endswith("Press Enter to close."))
+        self.assertEqual(stdin.read(), "")
+
+    def test_remove_ctrl_c(self):
+        code, _, _ = self.run_cli("learned", "remove", "example.com",
+                                  stdin_obj=KeyboardInterruptIn("", tty=True))
+        self.assertEqual(code, 130)
+        self.assertNotIn("learn_remove", self.daemon.ops())
+
+
+class TestLearnRun(CliTestCase):
+    def test_prints_each_decision(self):
+        self.daemon.routes["learn_run"] = LEARN_RESULT
+        code, out, err = self.run_cli("learn")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.daemon.requests, [{"op": "learn_run"}])
+        lines = out.splitlines()
+        self.assertEqual(lines[0], "Reviewing sites…")
+        self.assertIn("Blocked   lobste.rs  Lobsters — 34 min, almost no work", lines)
+        self.assertIn("Kept open docs.python.org  reference docs", lines)
+        self.assertIn("Need data some forum  only 12 min", lines)
+        self.assertIn("Skipped   foo.example (not in dns log)", lines)
+
+    def test_suggested_and_string_items(self):
+        self.daemon.routes["learn_run"] = {"ok": True, "result": {"suggested": ["twitch.tv"]}}
+        self.assertIn("Suggested twitch.tv", self.run_cli("learn")[1])
+
+    def test_nothing(self):
+        self.daemon.routes["learn_run"] = {"ok": True, "result": {
+            "added": [], "kept": [], "need_more_data": [], "skipped": [], "suggested": []}}
+        code, out, _ = self.run_cli("learn")
+        self.assertEqual(code, 0)
+        self.assertIn("Nothing to review yet.", out)
+
+    def test_json_has_no_waiting_line(self):
+        raw = '{"ok":true,"result":{"added":[]}}'
+        self.daemon.routes["learn_run"] = (raw + "\n").encode()
+        code, out, _ = self.run_cli("learn", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(out, raw + "\n")
+
+    def test_not_learning_and_busy(self):
+        for error, text in (("not_learning", "Adaptive blocking is off"),
+                            ("busy", "already running")):
+            self.daemon.routes["learn_run"] = {"ok": False, "error": error, "message": ""}
+            code, out, err = self.run_cli("learn")
+            self.assertEqual((code, err), (1, ""), error)
+            self.assertIn(text, out)
+            code, out, _ = self.run_cli("learn", "--json")
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(out)["error"], error)
+
+    def test_other_error(self):
+        self.daemon.routes["learn_run"] = {"ok": False, "error": "internal", "message": "boom"}
+        code, _, err = self.run_cli("learn")
+        self.assertEqual(code, 1)
+        self.assertIn("internal error: boom", err)
+
+    def test_ctrl_c(self):
+        def fake(obj, timeout=None):
+            raise KeyboardInterrupt
+        with mock.patch.object(cli, "request", fake):
+            code, _, err = self.run_cli("learn")
+        self.assertEqual(code, 130)
+        self.assertIn("review keeps running", err)
+
+
+class TestLearnedUnreachable(CliTestCase):
+    def setUp(self):
+        super().setUp()
+        self.daemon.close()
+        os.unlink(self.sock)
+
+    def test_exit_3(self):
+        for argv in (["learned"], ["learn"], ["learned", "add", "lobste.rs"],
+                     ["learned", "remove", "example.com", "it was work"]):
+            code, out, err = self.run_cli(*argv)
+            self.assertEqual(code, 3, argv)
+            self.assertIn("can't reach focusd", err)
+            self.assertNotIn("Asking", out)
+
+    def test_json(self):
+        for argv in (["learned", "--json"], ["learn", "--json"],
+                     ["learned", "add", "lobste.rs", "--json"]):
+            code, out, _ = self.run_cli(*argv)
+            self.assertEqual(code, 3, argv)
+            self.assertEqual(out, '{"ok":false,"error":"daemon_unreachable"}\n')
+
+
+class TestManyLearnedGroups(CliTestCase):
+    """Learned sites are ordinary groups, but there can be a lot of them."""
+
+    def test_status_collapses_them(self):
+        self.daemon.routes["status"] = status_with_learned(3)
+        code, out, _ = self.run_cli()
+        self.assertEqual(code, 0)
+        self.assertIn("Locked    YouTube, X, Porn +3 learned", out)
+        self.assertNotIn("learned label", out)
+        self.assertLessEqual(max(len(x) for x in out.splitlines()), 80)
+
+    def test_status_only_learned_locked(self):
+        st = make_status()
+        st["groups"] = [learned_group("a.example.com"), learned_group("b.example.com")]
+        self.daemon.routes["status"] = st
+        self.assertIn("Locked    +2 learned", self.run_cli()[1])
+
+    def test_status_today_collapses_them(self):
+        st = status_with_learned(3)
+        st["groups"][-1]["used_today_min"] = 10
+        st["groups"][-2]["used_today_min"] = 5
+        self.daemon.routes["status"] = st
+        self.assertIn("Today     YouTube 15/40 min · Reddit 20/40 min · +2 learned (15 min)",
+                      self.run_cli()[1])
+
+    def test_unlocked_learned_site_still_named(self):
+        st = status_with_learned(1)
+        st["unlocks"].append({"group": "l-site0-example-com", "label": "Site zero",
+                              "since": NOW - 60, "until": NOW + 300, "minutes": 6, "reason": "x"})
+        self.daemon.routes["status"] = st
+        self.assertIn("Site zero  5:00 left", self.run_cli()[1])
+
+    def test_picker_is_short_and_lines_fit(self):
+        self.daemon.routes["status"] = status_with_learned(8)
+        self.daemon.routes["unlock"] = GRANT
+        code, out, err = self.run_cli("unlock", stdin="7\nneed this one\n", tty_in=True)
+        self.assertEqual(code, 0, err)
+        menu = out.split("Unlock which group?")[1].split("Why do you need")[0]
+        self.assertIn("7) A rather long learned label number 4", menu)   # after 2 plain ones
+        self.assertNotIn("8)", menu)
+        self.assertNotIn("number 5", menu)
+        self.assertIn("+3 more learned sites: type a name or domain", menu)
+        self.assertLessEqual(max(len(x) for x in menu.splitlines()), 80)
+        self.assertEqual(self.daemon.last("unlock")["group"], "l-site4-example-com")
+
+    def test_hidden_site_can_be_typed_by_domain(self):
+        self.daemon.routes["status"] = status_with_learned(8)
+        self.daemon.routes["unlock"] = GRANT
+        code, _, err = self.run_cli("unlock", stdin="www.site7.example.com\nneed this one\n",
+                                    tty_in=True)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.daemon.last("unlock")["group"], "l-site7-example-com")
+
+    def test_unlocked_learned_site_listed_first(self):
+        st = status_with_learned(8)
+        st["groups"][-1].update(locked=False, unlocked_until=NOW + 300)
+        self.daemon.routes["status"] = st
+        code, out, _ = self.run_cli("unlock", stdin="", tty_in=True)
+        self.assertEqual(code, 1)                # EOF at the picker
+        self.assertIn("3) A rather long learned label number 7 (unlocked, 5 min left — extend)", out)
+
+    def test_unlock_by_domain_on_command_line(self):
+        self.daemon.routes["status"] = status_with_learned(2)
+        self.daemon.routes["unlock"] = GRANT
+        code, _, _ = self.run_cli("unlock", "site1.example.com", "need this one")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.daemon.last("unlock")["group"], "l-site1-example-com")
+
+    def test_unknown_group_does_not_list_them(self):
+        self.daemon.routes["status"] = status_with_learned(3)
+        code, out, _ = self.run_cli("unlock", "nope", "need this one")
+        self.assertEqual(code, 1)
+        self.assertIn("Groups: youtube, reddit, x, porn, news +3 learned.", out)
+
+    def test_groups_table_columns_stay_narrow(self):
+        self.daemon.routes["status"] = status_with_learned(2)
+        _, out, _ = self.run_cli("groups")
+        lines = out.splitlines()
+        self.assertEqual(len(lines), 7)
+        self.assertTrue(lines[0].startswith(
+            "youtube".ljust(19) + "  " + "YouTube".ljust(20) + "  locked"))
+
+
+class TestLearnEvents(CliTestCase):
+    def test_default_log_asks_for_learn_events(self):
+        self.daemon.routes["log"] = {"ok": True, "events": []}
+        self.run_cli("log")
+        types = self.daemon.last("log")["types"]
+        for t in ("learn_review", "learn_add", "learn_remove", "learn_remove_request",
+                  "learn_error"):
+            self.assertIn(t, types)
+
+    def test_timeline(self):
+        self.daemon.routes["log"] = {"ok": True, "events": [
+            {"t": NOW, "type": "learn_review", "candidates": ["a", "b"], "added": ["a"],
+             "kept": ["b"], "need_more_data": [], "skipped": [], "suggested": []},
+            {"t": NOW, "type": "learn_add", "domain": "lobste.rs", "label": "Lobsters",
+             "reason": "34 min", "by": "ai", "group": "l-lobste-rs"},
+            {"t": NOW, "type": "learn_remove_request", "session": "s", "domain": "lobste.rs",
+             "reason": "thesis"},
+            {"t": NOW, "type": "learn_remove", "domain": "lobste.rs", "by": "judge"},
+            {"t": NOW, "type": "learn_error", "error": "judge timed out"},
+            {"t": NOW, "type": "refused", "domain": "lobste.rs", "rule": "cooldown"},
+            {"t": NOW, "type": "refused", "penalty": "p1a2b3c4", "rule": "rate_limit"},
+        ]}
+        code, out, err = self.run_cli("log")
+        self.assertEqual(code, 0, err)
+        lines = out.splitlines()
+        self.assertIn("  17:33  site review: 2 candidates, 1 added, 1 kept", lines)
+        self.assertIn('  17:33  now blocking Lobsters (lobste.rs) by the AI: "34 min"', lines)
+        self.assertIn('  17:33  asked to unblock lobste.rs: "thesis"', lines)
+        self.assertIn("  17:33  lobste.rs no longer blocked (removed by the judge)", lines)
+        self.assertIn("  17:33  site review failed: judge timed out", lines)
+        self.assertIn("  17:33  lobste.rs refused (cooldown)", lines)
+        self.assertIn("  17:33  p1a2b3c4 refused (rate_limit)", lines)
+
+
 class TestUsage(CliTestCase):
     def test_unknown_command(self):
         code, _, err = self.run_cli("frobnicate")

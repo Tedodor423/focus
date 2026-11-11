@@ -112,6 +112,25 @@ max_entries = 150000
 # Order matters only for rendering. Every group: enabled, unlockable, optional
 # max_minutes/daily_minutes (effective cap = min(max_minutes, limits.max_unlock_minutes)).
 
+[learn]                    # adaptive blocking, ARCHITECTURE.md section 13
+mode = "auto"              # "off" | "suggest" (the AI's picks are only listed by `focus learned`) | "auto" (blocked)
+review_hours = 24          # how often the AI reviews the usage data (`focus learn` runs one now)
+window_days = 7            # how much history a review looks at
+min_minutes = 20           # focused minutes on a site within window_days before it can be considered
+max_work_share = 0.4       # a site the monitor mostly saw as work is never considered
+max_new_per_review = 2
+max_sites = 30
+unlock_max_minutes = 10    # learned sites unlock through the judge like any other group
+unlock_daily_minutes = 20
+# Never blocked by learning, whatever the AI says: messengers, mail, search and reference.
+# (never_block above also applies. These may still be blocked by hand in [groups.*].)
+never_learn = [
+  "whatsapp.com", "telegram.org", "messenger.com", "signal.org", "discord.com", "slack.com",
+  "zoom.us", "teams.live.com", "gmail.com", "proton.me", "seznam.cz",
+  "bing.com", "duckduckgo.com", "wikipedia.org", "wiktionary.org",
+  "spotify.com", "deepl.com", "chatgpt.com", "openai.com",
+]
+
 [groups.youtube]
 label = "YouTube"
 enabled = true
@@ -196,6 +215,27 @@ title_patterns = [
 ]
 # A bare "Instagram" title is used for the feed AND the DM inbox, so it is not a
 # pattern; the vision step decides those.
+
+[groups.linkedin]
+label = "LinkedIn"
+enabled = true
+unlockable = true
+max_minutes = 5            # enough for a short look or to post something; the judge can't grant more
+daily_minutes = 15         # at most three 5-minute unlocks a day
+hosts = [
+  "linkedin.com", "www.linkedin.com", "m.linkedin.com", "touch.linkedin.com",
+  "cz.linkedin.com", "uk.linkedin.com",
+]
+lists = []
+url_block = ["linkedin.com"]   # the browser rule also covers every country subdomain
+url_allow = []
+# lnkd.in (link shortener) and licdn.com (media) stay reachable: lnkd.in links often
+# lead to other sites, and with linkedin.com blocked the media leads nowhere anyway.
+webapp_classes = ['^chrome-([a-z]+\.)?linkedin\.com__']
+title_patterns = [
+  '(?i)(?:^|(?<=^\(\d\) )|(?<=^\(\d\d\) )|(?<=^\(\d\d\d\) )|(?<=[-—–|•·] ))(?:LinkedIn)(?=(?: [-—–] (?:Vivaldi|Chromium|Google Chrome|Brave|(?:Mozilla )?Firefox)\b[^-—–|]*)?$)',   # "Feed | LinkedIn", "(3) Feed | LinkedIn - Vivaldi", "LinkedIn"
+  '(?i)(?:^|(?<=^\(\d\) )|(?<=^\(\d\d\) )|(?<=^\(\d\d\d\) ))(?:LinkedIn)(?=(?: [-—–|•·]|:) )(?!.*[-—–|] (?:Wikipedia|Wiktionary|Google Search|Hledat Googlem|Vyhledat Googlem|DuckDuckGo|Bing|GitHub|Stack Overflow)\b)',   # "LinkedIn: Log In or Sign Up"
+]
 
 [groups.games]
 label = "Online games"

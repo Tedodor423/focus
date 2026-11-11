@@ -11,6 +11,7 @@ state.json:
 import datetime
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -19,6 +20,21 @@ from . import paths
 
 KEEP_RECENT_SECONDS = 2 * 86400   # in-memory window of events (covers "today")
 TAIL_SCAN_BYTES = 64 * 1024 * 1024
+
+
+_SURROGATES = re.compile("[\ud800-\udfff]")
+
+
+def scrub(value):
+    """Remove lone surrogates from JSON-decoded data. `"\\ud800"` is valid JSON but
+    can't be encoded to UTF-8, so one such string would break every later write."""
+    if isinstance(value, str):
+        return _SURROGATES.sub("", value)
+    if isinstance(value, list):
+        return [scrub(v) for v in value]
+    if isinstance(value, dict):
+        return {scrub(k): scrub(v) for k, v in value.items()}
+    return value
 
 
 # ---------------------------------------------------------------- days
@@ -35,6 +51,11 @@ def day_start(now: float, hm: tuple) -> float:
 def next_day_start(now: float, hm: tuple) -> float:
     start = datetime.datetime.fromtimestamp(day_start(now, hm))
     return (start + datetime.timedelta(days=1)).timestamp()
+
+
+def day_key(now: float, hm: tuple) -> str:
+    """The "YYYY-MM-DD" name of the `day_starts_at` day containing `now`."""
+    return time.strftime("%Y-%m-%d", time.localtime(day_start(now, hm)))
 
 
 def hhmm(t: float) -> str:
@@ -62,7 +83,7 @@ class State:
         """Atomic write, mode 0600 root: it holds unlock reasons and window
         titles, and nothing user-side reads it (everything goes via the socket)."""
         data = json.dumps(self.to_json(), indent=1, ensure_ascii=False) + "\n"
-        paths.atomic_write(path, data.encode(), mode=0o600)
+        paths.atomic_write(path, data.encode("utf-8", "replace"), mode=0o600)
 
     @classmethod
     def load(cls, path: str):
@@ -72,7 +93,7 @@ class State:
         if raw is None:
             return st, None
         try:
-            data = json.loads(raw)
+            data = scrub(json.loads(raw))
             if not isinstance(data, dict):
                 raise ValueError("not an object")
         except ValueError as e:
@@ -215,7 +236,7 @@ class EventLog:
         line = json.dumps(ev, ensure_ascii=False, separators=(",", ":")) + "\n"
         with self.lock:
             try:
-                self._write(line.encode())
+                self._write(line.encode("utf-8", "replace"))
             except OSError as e:
                 print(f"focusd: cannot append event: {e}", file=sys.stderr)
             self.recent.append(ev)

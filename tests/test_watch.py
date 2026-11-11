@@ -1109,6 +1109,158 @@ class AmendmentTests(Base):
         self.assertEqual(self.env.runtime_files(), ["focus-watch-fresh.ppm", "other.txt"])
 
 
+class LearnedTests(Base):
+    """Adaptive blocking (§13): learned sites arrive as status groups with `learned: true`."""
+    LOBSTERS = "chrome-lobste.rs__-Default"
+
+    def undecided_later(self):
+        self.env.write_state(next_vision_at=time.time() + 999, learned=[])
+
+    def test_locked_learned_group_matches_title_in_browser(self):
+        self.env.daemon.add_learned("lobste.rs", "Lobsters")
+        self.env.set_window("vivaldi-stable", "Some story - Lobsters - Vivaldi")
+        _, r = self.tick()
+        self.assertEqual((r["verdict"], r["source"], r["app"]), ("procrastinating", "title", "Lobsters"))
+
+    def test_locked_learned_group_matches_web_app_class(self):
+        self.env.daemon.add_learned("lobste.rs", "Lobsters")
+        self.env.set_window(self.LOBSTERS, "Front page")
+        _, r = self.tick()
+        self.assertEqual((r["verdict"], r["app"]), ("procrastinating", "Lobsters"))
+
+    def test_unlocked_learned_group_is_allowed(self):
+        self.env.daemon.add_learned("lobste.rs", "Lobsters", locked=False)
+        self.env.write_state(streak=2)
+        self.env.set_window(self.LOBSTERS, "Front page")
+        _, r = self.tick()
+        self.assertEqual((r["verdict"], r["source"], r["streak"]), ("allowed", "unlock", 0))
+
+    def test_learned_title_patterns_skip_native_apps(self):
+        self.env.daemon.add_learned("lobste.rs", "Lobsters")
+        self.undecided_later()
+        self.env.set_window("some-native-app", "notes - Lobsters")
+        self.assertEqual(self.tick()[1]["verdict"], "undecided")
+
+    def test_learned_group_overrides_a_config_group_with_the_same_id(self):
+        self.env.groups["l-lobste-rs"] = {"label": "Old", "title_patterns": ["never-matches"]}
+        self.env.write_config()
+        self.env.daemon.add_learned("lobste.rs", "Lobsters")
+        self.env.set_window("vivaldi-stable", "Some story - Lobsters - Vivaldi")
+        self.assertEqual(self.tick()[1]["app"], "Lobsters")
+
+    def test_learned_groups_follow_the_status_cache_rules(self):
+        self.env.daemon.add_learned("lobste.rs", "Lobsters")
+        self.env.write_state(next_vision_at=time.time() + 999)
+        self.env.set_window("vivaldi-stable", "Some story - Lobsters - Vivaldi")
+        w = self.watcher()
+        self.assertEqual(w.tick()["verdict"], "procrastinating")
+        self.env.daemon.stop()
+        self.assertEqual(w.tick()["verdict"], "procrastinating")  # cached
+        w._cache = (w._cache[0] - 601, w._cache[1])
+        self.assertEqual(w.tick()["verdict"], "undecided")        # too old: unknown
+
+    def test_no_status_means_no_learned_group_and_nothing_recorded(self):
+        self.env.daemon.stop()
+        self.env.write_state(next_vision_at=time.time() + 999)
+        self.env.set_window("vivaldi-stable", "Some story - Lobsters - Vivaldi")
+        self.assertEqual(self.tick()[1]["verdict"], "undecided")
+        self.assertIsNone(self.env.read_state()["learned"])
+
+    def test_missing_key_only_records(self):
+        self.env.write_state()
+        self.assertNotIn("learned", self.env.read_state())
+        g = self.env.daemon.add_learned("lobste.rs", "Lobsters")
+        self.env.set_window("foot", "shell")
+        self.tick()
+        self.assertEqual(self.env.notify_log(), [])
+        self.assertEqual(self.env.read_state()["learned"], [g["id"]])
+
+    def test_new_site_notifies_once(self):
+        self.env.set_window("foot", "shell")
+        w = self.watcher()
+        w.tick()
+        self.assertEqual(self.env.read_state()["learned"], [])  # recorded: nothing learned yet
+        g = self.env.daemon.add_learned("lobste.rs", "Lobsters")
+        w.tick()
+        w.tick()
+        self.assertEqual(self.env.notify_log(), [
+            ["-u", "normal", "Focus", "Now blocked: Lobsters. Remove: focus learned remove lobste.rs"]])
+        self.assertEqual(self.env.read_state()["learned"], [g["id"]])
+
+    def test_one_notification_per_site(self):
+        self.env.write_state(learned=[])
+        self.env.daemon.add_learned("lobste.rs", "Lobsters")
+        self.env.daemon.add_learned("tildes.net", "Tildes")
+        self.env.set_window("foot", "shell")
+        self.tick()
+        self.assertEqual([n[3].split(".")[0] for n in self.env.notify_log()],
+                         ["Now blocked: Lobsters", "Now blocked: Tildes"])
+
+    def test_already_recorded_site_is_silent_after_restart(self):
+        g = self.env.daemon.add_learned("lobste.rs", "Lobsters")
+        self.env.write_state(learned=[g["id"]])
+        self.env.set_window("foot", "shell")
+        self.tick()
+        self.assertEqual(self.env.notify_log(), [])
+
+    def test_site_that_disappears_and_returns_is_not_announced_again(self):
+        g = self.env.daemon.add_learned("lobste.rs", "Lobsters")
+        self.env.write_state(learned=[g["id"]])
+        self.env.set_window("foot", "shell")
+        w = self.watcher()
+        groups = self.env.daemon.status["groups"]
+        self.env.daemon.status["groups"] = [x for x in groups if x["id"] != g["id"]]
+        w.tick()
+        self.env.daemon.status["groups"] = groups
+        w.tick()
+        self.assertEqual(self.env.notify_log(), [])
+
+    def test_label_markup_is_escaped(self):
+        self.env.write_state(learned=[])
+        self.env.daemon.add_learned("a-b.example", "A&B <x>")
+        self.env.set_window("foot", "shell")
+        self.tick()
+        self.assertEqual(self.env.notify_log()[0][3],
+                         "Now blocked: A&amp;B &lt;x&gt;. Remove: focus learned remove a-b.example")
+
+    def test_disabled_learned_group_is_neither_announced_nor_recorded(self):
+        self.env.write_state(learned=[])
+        self.env.daemon.add_learned("lobste.rs", "Lobsters", locked=False, enabled=False)
+        self.env.set_window("foot", "shell")
+        self.tick()
+        self.assertEqual(self.env.notify_log(), [])
+        self.assertEqual(self.env.read_state()["learned"], [])
+
+    def test_announced_even_with_the_monitor_off(self):
+        self.env.write_state(learned=[])
+        self.env.daemon.add_learned("lobste.rs", "Lobsters")
+        self.env.daemon.set_mode("off")
+        _, r = self.tick()
+        self.assertIsNone(r["verdict"])
+        self.assertEqual(len(self.env.notify_log()), 1)
+        self.assertEqual(len(self.env.read_state()["learned"]), 1)
+
+    def test_dry_run_only_reports(self):
+        self.env.write_state(learned=[])
+        before = self.env.state_file().read_text()
+        self.env.daemon.add_learned("lobste.rs", "Lobsters")
+        self.env.set_window("foot", "shell")
+        _, r = self.tick(dry_run=True)
+        self.assertEqual([a["action"] for a in r["actions"]], ["notify"])
+        self.assertEqual(self.env.notify_log(), [])
+        self.assertEqual(self.env.state_file().read_text(), before)
+
+    def test_once_neither_notifies_nor_uses_up_the_notification(self):
+        self.env.write_state(learned=[])
+        self.env.daemon.add_learned("lobste.rs", "Lobsters")
+        self.env.set_window("foot", "shell")
+        self.tick(once=True)
+        self.assertEqual(self.env.notify_log(), [])
+        self.assertEqual(self.env.read_state()["learned"], [])
+        self.tick()
+        self.assertEqual(len(self.env.notify_log()), 1)
+
+
 class ConfigReloadTests(Base):
     def test_reload_on_mtime_change(self):
         self.env.set_window("vivaldi-stable", "Lobsters - Vivaldi")

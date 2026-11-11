@@ -5,6 +5,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -18,6 +19,10 @@ FETCH_TIMEOUT = 30
 RETRY_SECONDS = 3600
 DNSLOG_CAP = 50 * 1024 * 1024
 DNSLOG_WINDOW = 15 * 60
+DNSLOG_SCAN_CAP = 200 * 1024 * 1024
+RECENT_SECONDS = 7 * 86400
+_LOG_NAME = re.compile(rb'"name"\s*:\s*"([^"\\]+)"')
+_LOG_TIME = re.compile(rb'"t"\s*:\s*([0-9]+(?:\.[0-9]+)?)')
 
 
 def parse_list(text: str, never_block=()) -> list:
@@ -166,12 +171,45 @@ class Lists:
 
 # ---------------------------------------------------------------- DNS log
 
-def _dnslog_files(directory: str, now: float) -> list:
+def _dnslog_files(directory: str, now: float, count: int = 2) -> list:
     days = set()
-    for t in (now, now - 86400):
+    for t in (now - i * 86400 for i in range(count)):
         days.add(datetime.datetime.fromtimestamp(t).strftime("%Y-%m-%d"))
         days.add(datetime.datetime.fromtimestamp(t, datetime.UTC).strftime("%Y-%m-%d"))
     return [os.path.join(directory, f"{d}.jsonl") for d in sorted(days, reverse=True)]
+
+
+def dnslog_scan(now: float, days: int, cap: int = DNSLOG_SCAN_CAP) -> dict | None:
+    """What the DNS log saw in the last `days` days, newest file first, reading
+    at most `cap` bytes: {name: [lookups in the last 7 days, newest t]}.
+    None when there is no log directory."""
+    directory = paths.dnslog_dir()
+    if not os.path.isdir(directory):
+        return None
+    oldest, recent = now - days * 86400, now - RECENT_SECONDS
+    names, budget = {}, cap
+    for path in _dnslog_files(directory, now, days + 1):
+        if budget <= 0:
+            break
+        try:
+            with open(path, "rb") as f:
+                size = f.seek(0, os.SEEK_END)
+                n = min(size, budget)
+                f.seek(size - n)
+                if n < size:
+                    f.readline()          # started mid-line
+                budget -= n
+                for line in f:
+                    t, name = _LOG_TIME.search(line), _LOG_NAME.search(line)
+                    if not t or not name or float(t[1]) < oldest:
+                        continue
+                    entry = names.setdefault(
+                        name[1].decode("ascii", "ignore").lower().rstrip("."), [0, 0.0])
+                    entry[0] += float(t[1]) >= recent
+                    entry[1] = max(entry[1], float(t[1]))
+        except OSError:
+            continue
+    return names
 
 
 def dnslog_check(domain: str, now: float) -> str | None:
